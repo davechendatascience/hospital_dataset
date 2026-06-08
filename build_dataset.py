@@ -94,6 +94,11 @@ def parse_args() -> argparse.Namespace:
                    help="Camera horizontal FOV (deg)")
     p.add_argument("--rt-subframes", type=int, default=8,
                    help="Path-trace sub-frames per render (higher = cleaner)")
+    p.add_argument("--randomize-materials", action="store_true",
+                   help="Forward to replicator_dataset.py: per-frame perturb "
+                        "each object's ORIGINAL material in place (diffuse-"
+                        "texture tint, colour jitter, roughness re-rolls). "
+                        "No texture bank needed.")
     p.add_argument("--train-seed", type=int, default=42)
     p.add_argument("--val-seed",   type=int, default=43)
     p.add_argument("--skip-render", action="store_true",
@@ -193,6 +198,8 @@ def run_replicator(args: argparse.Namespace, split: str, n_frames: int,
         "--hfov",     str(args.hfov),
         "--rt-subframes", str(args.rt_subframes),
     ]
+    if getattr(args, "randomize_materials", False):
+        cmd += ["--randomize-materials"]
     print(f"[render] {split}: invoking replicator with {n_frames} frames "
           f"(seed={seed}) -> {render_root}")
     print("        $", " ".join(cmd))

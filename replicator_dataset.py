@@ -75,6 +75,14 @@ def parse_args():
     p.add_argument("--save-layout-png", action="store_true", default=True,
                    help="Write <out>/_room_layout.png so you can verify the "
                         "detected rooms visually.")
+    # --- Online material domain-randomization (perturb originals) ---
+    p.add_argument("--randomize-materials", action="store_true", default=False,
+                   help="Per-frame perturb the labeled objects' ORIGINAL "
+                        "materials in place: per-channel tint on the baked "
+                        "diffuse texture, colour jitter for untextured shaders, "
+                        "and roughness re-rolls. Objects keep their identity; "
+                        "geometry is untouched, so masks/boxes stay valid. "
+                        "Off by default.")
     return p.parse_args()
 
 
@@ -456,6 +464,7 @@ obj_bounds = compute_object_aabb(stage, matched_paths)
 if obj_bounds is None:
     print("[room] WARNING: could not compute object AABB; falling back to "
           "/CollisionMesh bounds (camera will likely spawn outside the room)")
+    floor_z = float(bmin[2])
 else:
     omin, omax = obj_bounds
     print(f"[room] object-derived interior min=({omin[0]:.2f}, {omin[1]:.2f}, "
@@ -481,19 +490,32 @@ _WALL_NAME_RE = re.compile(r"wall", re.I)
 
 
 def find_wall_aabbs(stage):
-    """Return list of axis-aligned world bounding boxes for all wall meshes."""
+    """Return list of axis-aligned world bounding boxes for wall MESHES.
+
+    Leaf meshes only: group Xforms like /World/WallAssets or /World/wardwall
+    have AABBs spanning ~half the room interior, and treating those as solid
+    walls made every camera candidate test "inside a wall" (the rejection
+    loop then exhausted its attempts and fell back to unchecked samples).
+    Thin Xform/Scope prims (a single wrapped wall) are still accepted via the
+    slab test."""
     bcache = UsdGeom.BBoxCache(Usd.TimeCode.Default(),
                                [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
     aabbs = []
     for prim in stage.Traverse():
         if not _WALL_NAME_RE.search(prim.GetName()):
             continue
-        if prim.GetTypeName() not in ("Mesh", "Xform", "Scope"):
+        t = prim.GetTypeName()
+        if t not in ("Mesh", "Xform", "Scope"):
             continue
         try:
             box = bcache.ComputeWorldBound(prim).ComputeAlignedBox()
             mn, mx = box.GetMin(), box.GetMax()
             if any(abs(v) > 1e6 for v in (mn[0], mn[1], mn[2], mx[0], mx[1], mx[2])):
+                continue
+            sx, sy = float(mx[0] - mn[0]), float(mx[1] - mn[1])
+            # Group prims must look like an actual wall slab (one thin
+            # horizontal dimension); meshes are taken as-is.
+            if t != "Mesh" and min(sx, sy) > 0.6:
                 continue
             aabbs.append((
                 (float(mn[0]), float(mn[1]), float(mn[2])),
@@ -551,6 +573,62 @@ def _inside_any_wall(point):
         if _point_in_aabb(point, w):
             return True
     return False
+
+
+def _inside_any_object(point, aabbs, margin=0.10):
+    """True if `point` lies inside (or within `margin` m of) any of the given
+    world AABBs. Used to reject camera positions that would put the eye
+    inside a bed/cabinet/cart mesh."""
+    for mn, mx in aabbs:
+        if (mn[0] - margin <= point[0] <= mx[0] + margin and
+                mn[1] - margin <= point[1] <= mx[1] + margin and
+                mn[2] - margin <= point[2] <= mx[2] + margin):
+            return True
+    return False
+
+
+def collect_blocker_aabbs(stage, labeled_paths, max_side=4.0, max_depth=3):
+    """World AABBs of UNLABELED scene geometry under /World (CabinetAssets,
+    industrialpipingmodel, ...) that the camera must not spawn inside —
+    labeled objects are handled separately and cameras inside unlabeled
+    furniture render pitch-black frames. Group prims whose footprint exceeds
+    `max_side` m are recursed into (one level at a time) so a room-spanning
+    group like GroundPlane doesn't blanket the whole interior."""
+    bcache = UsdGeom.BBoxCache(Usd.TimeCode.Default(),
+                               [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+    skip = set(labeled_paths)
+    out = []
+
+    def visit(prim, depth):
+        if str(prim.GetPath()) in skip:
+            return
+        if prim.GetTypeName() not in ("Mesh", "Xform", "Scope", ""):
+            return  # lights, graphs, materials, ...
+        try:
+            box = bcache.ComputeWorldBound(prim).ComputeAlignedBox()
+            mn, mx = box.GetMin(), box.GetMax()
+        except Exception:
+            return
+        if any(abs(v) > 1e6 for v in (mn[0], mn[1], mn[2], mx[0], mx[1], mx[2])):
+            return
+        sx, sy = float(mx[0] - mn[0]), float(mx[1] - mn[1])
+        if max(sx, sy) <= max_side:
+            out.append(((float(mn[0]), float(mn[1]), float(mn[2])),
+                        (float(mx[0]), float(mx[1]), float(mx[2]))))
+        elif depth < max_depth:
+            for child in prim.GetChildren():
+                visit(child, depth + 1)
+
+    for top in stage.GetPrimAtPath("/World").GetChildren():
+        visit(top, 0)
+    return out
+
+
+blocker_aabbs = collect_blocker_aabbs(stage, matched_paths)
+# Camera no-go volumes: every labeled object + every unlabeled blocker.
+no_go_aabbs = [ot["aabb"] for ot in object_targets] + blocker_aabbs
+print(f"[camera] {len(no_go_aabbs)} no-go AABBs for camera placement "
+      f"({len(object_targets)} labeled + {len(blocker_aabbs)} unlabeled)")
 
 
 # ============================================================================
@@ -867,44 +945,62 @@ def sample_camera_pose(rng):
             rng.uniform(bmin[0] + mx_, bmax[0] - mx_),
             rng.uniform(bmin[1] + mx_, bmax[1] - mx_),
             floor_z + rng.uniform(0.4, 1.7),
-        )
+        ), True
 
     weights = [len(r["members"]) for r in rooms_with_members]
     room = rng.choices(rooms_with_members, weights=weights, k=1)[0]
     target_obj = rng.choice(room["members"])
     target = target_obj["centroid"]
 
-    # Sample camera position anywhere inside the room's XY AABB. The AABB
-    # comes from the room's labeled objects + a small inflation, so a sample
-    # may sit close to or even slightly outside one of the wall meshes —
-    # that's acceptable because the room AABB itself was derived from real
-    # in-room object positions.
-    cam_x = cam_y = 0.0
-    for _ in range(15):
+    # Rejection-sample the camera position: far enough from the target AND
+    # not inside a wall mesh or any labeled object's AABB (a camera inside
+    # geometry renders cut-open/black frames). Fall back to the last sample
+    # if no candidate passes — the frame filter will prune it downstream.
+    pos = None
+    for _ in range(50):
         cam_x = rng.uniform(room["xmin"], room["xmax"])
         cam_y = rng.uniform(room["ymin"], room["ymax"])
+        cam_z = floor_z + rng.uniform(args.height_min, args.height_max)
+        cand = (cam_x, cam_y, cam_z)
         d2 = (target[0] - cam_x) ** 2 + (target[1] - cam_y) ** 2
-        if d2 >= args.min_cam_distance ** 2:
-            break
-
-    cam_z = floor_z + rng.uniform(args.height_min, args.height_max)
-    pos = (cam_x, cam_y, cam_z)
+        if d2 < args.min_cam_distance ** 2:
+            pos = cand
+            continue
+        if _inside_any_wall(cand) or _inside_any_object(cand, no_go_aabbs):
+            pos = cand
+            continue
+        if _line_of_sight_blocked(cand, target):
+            # Room AABBs are centroid-derived and can spill past a wall; a
+            # blocked sight line means the camera landed in the wrong room.
+            pos = cand
+            continue
+        pos = cand
+        accepted = True
+        break
+    else:
+        accepted = False
     jit = 0.15
     look = (
         target[0] + rng.uniform(-jit, jit),
         target[1] + rng.uniform(-jit, jit),
         target[2] + rng.uniform(-jit, jit),
     )
-    return pos, look
+    return pos, look, accepted
 
 
 rng = random.Random(args.seed)
 camera_positions = []
 camera_targets   = []
+_n_fallback = 0
 for _ in range(args.frames):
-    p, t = sample_camera_pose(rng)
+    p, t, ok = sample_camera_pose(rng)
     camera_positions.append(p)
     camera_targets.append(t)
+    if not ok:
+        _n_fallback += 1
+print(f"[camera] {args.frames - _n_fallback}/{args.frames} poses passed all "
+      f"placement checks; {_n_fallback} fell back to an unchecked sample "
+      f"(high fallback count -> no-go volumes are over-rejecting)")
 
 
 # Camera + render product live at stage scope (not inside a new layer) so the
@@ -914,6 +1010,10 @@ cam = rep.create.camera(
     look_at=camera_targets[0],
     focal_length=focal,
     horizontal_aperture=H_APERTURE,
+    # Default clipping_range is (1.0, 1e6) in WORLD units; this stage is in
+    # meters, so the default near plane sat 1 m in front of the camera and
+    # sliced open any geometry closer than that ("partial object rendering").
+    clipping_range=(0.05, 100000.0),
 )
 rp = rep.create.render_product(cam, resolution=tuple(args.resolution))
 
@@ -938,8 +1038,132 @@ try:
 except Exception as e:
     print(f"[camera] (could not set vertical_aperture explicitly: {e})")
 
+# ---- Online material domain-randomization (perturb originals) ------------ #
+# Keeps every labeled object's OWN baked material and jitters it in place each
+# frame instead of rebinding procedural textures: per-channel tint on the
+# diffuse texture (UsdUVTexture inputs:scale), diffuseColor jitter around the
+# authored colour for untextured shaders, and roughness re-rolls. Objects keep
+# their identity; geometry is never touched, so masks/boxes stay exactly valid.
+MATERIAL_DR = bool(args.randomize_materials)
+if MATERIAL_DR and not matched_paths:
+    print("[material-dr] no labeled object prims found -> disabling material DR")
+    MATERIAL_DR = False
+if MATERIAL_DR:
+    import re as _re
+    from pxr import UsdShade  # noqa: E402
+
+    def _ensure_input(shader_prim, name, type_name, default):
+        # rep.modify.attribute only randomizes attributes that already exist on
+        # the prim, and the GLB/Tripo converters rarely author these inputs ->
+        # author the neutral default once so the per-frame trigger can hit it.
+        attr = shader_prim.GetAttribute(f"inputs:{name}")
+        if not attr or attr.Get() is None:
+            UsdShade.Shader(shader_prim).CreateInput(name, type_name).Set(default)
+
+    tex_scale_paths = []  # UsdUVTexture feeding diffuseColor -> tint via inputs:scale
+    rough_paths = []      # UsdPreviewSurface shaders -> re-roll inputs:roughness
+    color_ranges = []     # untextured UsdPreviewSurface -> (path, lo, hi) jitter
+    mdl_tint_paths = []   # MDL shaders (OmniPBR etc.) -> tint via diffuse_tint
+
+    # Resolve each labeled object's bound material via the binding API (the
+    # materials live inside the referenced .usdz subtrees, but this also
+    # catches ones bound from a shared /World/Looks scope).
+    _seen_mats = set()
+    for _root in matched_paths:
+        for prim in Usd.PrimRange(stage.GetPrimAtPath(_root)):
+            if not prim.IsA(UsdGeom.Gprim):
+                continue
+            mat, _ = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial()
+            if not mat or mat.GetPath() in _seen_mats:
+                continue
+            _seen_mats.add(mat.GetPath())
+            try:
+                surf, _, _ = mat.ComputeSurfaceSource(["mdl"])
+            except TypeError:  # older USD: single render-context token
+                surf, _, _ = mat.ComputeSurfaceSource("mdl")
+            if not surf:
+                continue
+            sprim = surf.GetPrim()
+            if surf.GetIdAttr().Get() == "UsdPreviewSurface":
+                _ensure_input(sprim, "roughness", Sdf.ValueTypeNames.Float, 0.5)
+                rough_paths.append(str(sprim.GetPath()))
+                dc = surf.GetInput("diffuseColor")
+                if dc and dc.HasConnectedSource():
+                    # Perturb ONLY the texture node feeding diffuseColor --
+                    # blanket-scaling every UsdUVTexture would corrupt
+                    # normal/roughness maps on multi-map materials.
+                    src, _, _ = dc.GetConnectedSource()
+                    tprim = src.GetPrim()
+                    if UsdShade.Shader(tprim).GetIdAttr().Get() == "UsdUVTexture":
+                        _ensure_input(tprim, "scale", Sdf.ValueTypeNames.Float4,
+                                      Gf.Vec4f(1.0))
+                        tex_scale_paths.append(str(tprim.GetPath()))
+                else:
+                    # Constant-colour shader: jitter AROUND the authored colour
+                    # (full-gamut randomization would erase object identity).
+                    c = dc.Get() if dc else None
+                    c = c if c is not None else Gf.Vec3f(0.5)
+                    _ensure_input(sprim, "diffuseColor",
+                                  Sdf.ValueTypeNames.Color3f, Gf.Vec3f(c))
+                    lo = tuple(max(0.0, v * 0.7 - 0.05) for v in c)
+                    hi = tuple(min(1.0, v * 1.3 + 0.05) for v in c)
+                    color_ranges.append((str(sprim.GetPath()), lo, hi))
+            elif sprim.GetAttribute("info:mdl:sourceAsset"):
+                _ensure_input(sprim, "diffuse_tint",
+                              Sdf.ValueTypeNames.Color3f, Gf.Vec3f(1.0))
+                _ensure_input(sprim, "reflection_roughness_constant",
+                              Sdf.ValueTypeNames.Float, 0.5)
+                mdl_tint_paths.append(str(sprim.GetPath()))
+
+    def _pattern(paths):
+        return "^(" + "|".join(_re.escape(p) for p in paths) + ")$"
+
+    # flush=True: sim_app.close() hard-exits without flushing stdio, so any
+    # buffered tail prints are silently lost from redirected logs.
+    print(f"[material-dr] perturbing originals: {len(tex_scale_paths)} textured "
+          f"+ {len(color_ranges)} flat-colour + {len(mdl_tint_paths)} MDL "
+          f"shaders across {len(_seen_mats)} bound materials", flush=True)
+    if not (tex_scale_paths or color_ranges or mdl_tint_paths):
+        print("[material-dr] no perturbable shaders found -> disabling material DR")
+        MATERIAL_DR = False
+
 # Per-frame randomization: camera pose + ceiling-light intensity/color temp
 with rep.trigger.on_frame(num_frames=args.frames, rt_subframes=args.rt_subframes):
+    if MATERIAL_DR:
+        # Jitter each object's ORIGINAL material in place every frame. Each
+        # matched prim draws its own independent sample (same per-prim
+        # behaviour as the ceiling lights below).
+        # NOTE: ignore_case=False everywhere -- rep.get.prims defaults to
+        # case-INsensitive regex, which made exact paths under /World/toilet
+        # also match the case-twin /World/Toilet (different asset instance,
+        # different authored attrs) and spam write errors.
+        if tex_scale_paths:
+            # Per-channel multiplier on the baked diffuse texture: covers
+            # brightness + tint + mild hue shifts without losing the texture.
+            with rep.get.prims(path_pattern=_pattern(tex_scale_paths),
+                               ignore_case=False):
+                rep.modify.attribute("inputs:scale", rep.distribution.uniform(
+                    (0.55, 0.55, 0.55, 1.0), (1.45, 1.45, 1.45, 1.0)))
+        for _cpath, _clo, _chi in color_ranges:
+            # One node per shader: the jitter range is centred on THAT
+            # shader's authored colour, so it can't be a shared distribution.
+            with rep.get.prims(path_pattern=_pattern([_cpath]),
+                               ignore_case=False):
+                rep.modify.attribute("inputs:diffuseColor",
+                                     rep.distribution.uniform(_clo, _chi))
+        if rough_paths:
+            with rep.get.prims(path_pattern=_pattern(rough_paths),
+                               ignore_case=False):
+                rep.modify.attribute("inputs:roughness",
+                                     rep.distribution.uniform(0.20, 0.95))
+        if mdl_tint_paths:
+            with rep.get.prims(path_pattern=_pattern(mdl_tint_paths),
+                               ignore_case=False):
+                rep.modify.attribute("inputs:diffuse_tint",
+                                     rep.distribution.uniform(
+                                         (0.55, 0.55, 0.55), (1.45, 1.45, 1.45)))
+                rep.modify.attribute("inputs:reflection_roughness_constant",
+                                     rep.distribution.uniform(0.20, 0.95))
     with cam:
         rep.modify.pose(
             position=rep.distribution.sequence(camera_positions),
@@ -978,7 +1202,10 @@ with rep.trigger.on_frame(num_frames=args.frames, rt_subframes=args.rt_subframes
 
 # Writer: BasicWriter outputs RGB + COCO-ish data; we'll fold into your
 # rgbDataset/jsonDataset layout in step 6 below.
-raw_out = Path(args.out) / "_raw"
+# Absolute path: Replicator's disk backend redirects RELATIVE output_dir to a
+# default root (~/omni.replicator_out), which then doesn't match where the
+# post-process step looks -> "0 RGB files". Resolve so frames land under --out.
+raw_out = (Path(args.out) / "_raw").resolve()
 raw_out.mkdir(parents=True, exist_ok=True)
 writer = rep.WriterRegistry.get("BasicWriter")
 writer.initialize(

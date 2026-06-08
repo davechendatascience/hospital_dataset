@@ -251,7 +251,10 @@ class GistFirstNetwork(nn.Module):
             feat = self.dino(pixel_values).feature_maps[0]   # (B, H, gh, gw)
         tokens = feat.flatten(2).transpose(1, 2)             # (B, N, H)
         g = self._gist(tokens)                               # global gist FIRST
-        self.last_aux_logits = self.aux_head(g) if self.training else None
+        # Compute aux logits in BOTH train and eval: training uses them for the
+        # global-first loss; eval reads them as the gist-transfer probe (does
+        # the global object-inventory commitment survive the sim->real shift?).
+        self.last_aux_logits = self.aux_head(g)
 
         gamma, beta = self.film(g).chunk(2, dim=-1)          # (B, H), (B, H)
 
@@ -401,6 +404,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--eval-splits", default=",".join(DEFAULT_EVAL_SPLITS),
                    help="Comma-separated splits to evaluate every epoch")
+    p.add_argument("--gap-pair", default="valid,real_dev",
+                   help="'<sim_split>,<real_split>' whose AP difference is "
+                        "logged each epoch as the sim->real gap column.")
+    p.add_argument("--dump-overlays", type=int, default=0,
+                   help="If >0, save this many predicted-mask overlays per "
+                        "epoch from --overlay-split (qualitative inspection).")
+    p.add_argument("--overlay-split", default=None,
+                   help="Split to draw overlays from (default: first eval split).")
     p.add_argument("--eval-batch", type=int, default=2)
     p.add_argument("--score-thresh", type=float, default=0.5,
                    help="Min score for a predicted mask to count in eval")
@@ -510,10 +521,35 @@ def evaluate_split(model, processor, ds: CocoInstanceSeg, device, args) -> dict:
         collate_fn=make_eval_collate(processor), pin_memory=True,
     )
     results: list[dict] = []
+
+    # Gist-transfer probe (gfn only): does the aux head predict each image's
+    # object inventory under the domain shift? Micro-F1 of the image-level
+    # multilabel prediction vs the GT class set. Trains/converges far faster
+    # than mask AP, so it's the reliable early signal for the research loop.
+    encoder = getattr(getattr(getattr(model, "model", None),
+                              "pixel_level_module", None), "encoder", None)
+    aux_capable = encoder is not None and hasattr(encoder, "aux_head")
+    aux_tp = aux_fp = aux_fn = 0
+    gt_label_sets: dict[int, set[int]] = {}
+    if aux_capable:
+        for img_id in ds.img_ids:
+            gt_label_sets[img_id] = {
+                a["category_id"] - 1 for a in ds.coco.imgToAnns.get(img_id, [])
+                if a["category_id"] != 0
+            }
+
     for batch in loader:
         pixel_values = batch["pixel_values"].to(device)
         pixel_mask = batch["pixel_mask"].to(device)
         outputs = model(pixel_values=pixel_values, pixel_mask=pixel_mask)
+        if aux_capable and encoder.last_aux_logits is not None:
+            preds = (encoder.last_aux_logits.sigmoid() > 0.5)
+            for row, img_id in zip(preds, batch["image_ids"]):
+                pred_set = set(torch.nonzero(row).flatten().tolist())
+                gt = gt_label_sets.get(img_id, set())
+                aux_tp += len(pred_set & gt)
+                aux_fp += len(pred_set - gt)
+                aux_fn += len(gt - pred_set)
         processed = processor.post_process_instance_segmentation(
             outputs,
             target_sizes=batch["orig_sizes"],
@@ -536,8 +572,14 @@ def evaluate_split(model, processor, ds: CocoInstanceSeg, device, args) -> dict:
                     "score": float(sinfo["score"]),
                 })
 
+    aux_f1 = None
+    if aux_capable and (aux_tp + aux_fp + aux_fn) > 0:
+        prec = aux_tp / (aux_tp + aux_fp) if (aux_tp + aux_fp) else 0.0
+        rec = aux_tp / (aux_tp + aux_fn) if (aux_tp + aux_fn) else 0.0
+        aux_f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
+
     if not results:
-        return {"AP": 0.0, "AP50": 0.0, "AP75": 0.0, "n_preds": 0}
+        return {"AP": 0.0, "AP50": 0.0, "AP75": 0.0, "n_preds": 0, "aux_f1": aux_f1}
 
     coco_gt = ds.coco
     coco_dt = coco_gt.loadRes(results)
@@ -554,7 +596,63 @@ def evaluate_split(model, processor, ds: CocoInstanceSeg, device, args) -> dict:
         "AP50": float(ev.stats[1]),
         "AP75": float(ev.stats[2]),
         "n_preds": len(results),
+        "aux_f1": aux_f1,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Qualitative inference dump (predicted instance masks over the RGB)
+# --------------------------------------------------------------------------- #
+def _palette(n: int) -> list[tuple]:
+    import colorsys
+    return [tuple(int(255 * c) for c in colorsys.hsv_to_rgb((i * 0.61803) % 1.0,
+                                                            0.65, 0.95))
+            for i in range(max(n, 1))]
+
+
+@torch.no_grad()
+def dump_overlays(model, processor, ds: "CocoInstanceSeg", device, args,
+                  epoch: int, out_dir: Path) -> None:
+    """Save the first N images of `ds` with predicted instance masks + class
+    labels composited over them, so each research round has qualitative real-
+    domain failure modes to inspect (not just the scalar gap)."""
+    from PIL import ImageDraw
+    model.eval()
+    pal = _palette(NUM_LABELS)
+    n = min(args.dump_overlays, len(ds))
+    odir = out_dir / "overlays" / f"epoch{epoch}"
+    odir.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        item = ds[i]
+        image = item["image"].convert("RGB")
+        enc = processor(images=[image], return_tensors="pt")
+        outputs = model(pixel_values=enc["pixel_values"].to(device),
+                        pixel_mask=enc["pixel_mask"].to(device))
+        res = processor.post_process_instance_segmentation(
+            outputs, target_sizes=[item["orig_size"]],
+            threshold=args.score_thresh, return_binary_maps=True)[0]
+        arr = np.array(image)
+        seg, info = res["segmentation"], res["segments_info"]
+        boxes = []
+        if seg is not None and len(info):
+            seg = seg.cpu().numpy().astype(bool)
+            for k, si in enumerate(info):
+                color = np.array(pal[si["label_id"] % NUM_LABELS])
+                m = seg[k]
+                arr[m] = (0.5 * arr[m] + 0.5 * color).astype(np.uint8)
+                ys, xs = np.where(m)
+                if len(xs):
+                    boxes.append((int(xs.min()), int(ys.min()),
+                                  ID2LABEL.get(si["label_id"], str(si["label_id"])),
+                                  float(si["score"]),
+                                  tuple(int(c) for c in color)))
+        canvas = Image.fromarray(arr)
+        draw = ImageDraw.Draw(canvas)
+        for x, y, label, score, color in boxes:
+            draw.text((x, max(0, y - 10)), f"{label} {score:.2f}", fill=color)
+        stem = Path(ds.coco.imgs[ds.img_ids[i]]["file_name"]).stem
+        canvas.save(odir / f"{stem}.png")
+    print(f"[seg-detr] wrote {n} prediction overlays -> {odir}")
 
 
 # --------------------------------------------------------------------------- #
@@ -656,11 +754,19 @@ def main() -> None:
     use_amp = device.type == "cuda"
     gfn_aux_weight = args.gfn_aux_weight if args.backbone == "gfn" else 0.0
 
+    # ----- overlay + gap config ------------------------------------------- #
+    overlay_split = args.overlay_split or (next(iter(eval_dss)) if eval_dss else None)
+    overlay_ds = eval_dss.get(overlay_split) if overlay_split else None
+    gap_sim, gap_real = [s.strip() for s in (args.gap_pair.split(",") + ["", ""])[:2]]
+    log_gap = gap_sim in eval_dss and gap_real in eval_dss
+
     # ----- metrics csv ---------------------------------------------------- #
     csv_path = out_dir / "metrics.csv"
     fieldnames = ["epoch", "train_loss"]
     for s in eval_dss:
-        fieldnames += [f"{s}_AP", f"{s}_AP50", f"{s}_AP75"]
+        fieldnames += [f"{s}_AP", f"{s}_AP50", f"{s}_AP75", f"{s}_auxF1"]
+    if log_gap:
+        fieldnames.append("sim_real_gap_AP")
     rows: list[dict] = []
 
     def run_eval(epoch: int, train_loss: float) -> None:
@@ -670,14 +776,26 @@ def main() -> None:
             row[f"{s}_AP"] = round(m["AP"], 4)
             row[f"{s}_AP50"] = round(m["AP50"], 4)
             row[f"{s}_AP75"] = round(m["AP75"], 4)
+            row[f"{s}_auxF1"] = (round(m["aux_f1"], 4)
+                                 if m.get("aux_f1") is not None else "")
+            aux_str = (f" auxF1={m['aux_f1']:.4f}"
+                       if m.get("aux_f1") is not None else "")
             print(f"[eval@epoch{epoch}] {s:10s} "
-                  f"AP={m['AP']:.4f} AP50={m['AP50']:.4f} AP75={m['AP75']:.4f} "
-                  f"(n_preds={m['n_preds']})")
+                  f"AP={m['AP']:.4f} AP50={m['AP50']:.4f} AP75={m['AP75']:.4f}"
+                  f"{aux_str} (n_preds={m['n_preds']})")
+        if log_gap:
+            row["sim_real_gap_AP"] = round(row[f"{gap_sim}_AP"]
+                                           - row[f"{gap_real}_AP"], 4)
+            print(f"[eval@epoch{epoch}] sim->real gap "
+                  f"(AP {gap_sim}-{gap_real}) = {row['sim_real_gap_AP']:.4f}")
         rows.append(row)
         with open(csv_path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fieldnames)
             w.writeheader()
             w.writerows(rows)
+        if args.dump_overlays > 0 and overlay_ds is not None:
+            dump_overlays(model, processor, overlay_ds, device, args,
+                          epoch, out_dir)
 
     if args.eval_first:
         print("[seg-detr] baseline eval (epoch 0, untrained class head)")

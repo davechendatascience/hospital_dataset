@@ -314,7 +314,20 @@ Secondary probes:
 
 ---
 
-## 9. Status & next step
+## 9. Single-file research template
+
+For iterating on the architecture itself (without the training/eval harness),
+`docs/gfn_template.py` is a self-contained condensation of the GFN: the
+`GistFirstNetwork` module, the Mask2Former integration, and a runnable
+self-test, with every perturbation point tagged `# >>> RESEARCH KNOB` and all
+knobs hoisted into a single `GFNConfig`. It exposes more knobs than the
+production `train_seg_detr.py` (multi-scale gist via `gist_source_stages`;
+`gate_type ∈ {film, seed, none, xattn}` where `xattn` is the §5.1 gist-gated
+cross-attention upgrade). Run `python docs/gfn_template.py` for the contract
+self-test. The autoresearch loop (`autoresearch/PROTOCOL.md`) drives changes to
+these knobs round by round.
+
+## 10. Status & next step
 
 **Done:** GFN is implemented as `--backbone gfn` in `train_seg_detr.py`, reusing
 the `Dinov2SimpleFPN` backbone contract (`.channels` + `.feature_maps`). The gist

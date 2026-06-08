@@ -99,7 +99,7 @@ def subset_coco(coco: dict, keep_image_ids: set[int]) -> dict:
 
 def materialize_split(name: str, image_ids: set[int],
                       coco: dict, src_root: Path, dst_root: Path,
-                      cat_id_to_name: dict) -> dict:
+                      cat_id_to_name: dict, src_split: str = "test") -> dict:
     split_dir = dst_root / name
     img_dir = split_dir / "images"
     lbl_dir = split_dir / "labels"
@@ -108,8 +108,8 @@ def materialize_split(name: str, image_ids: set[int],
 
     # Symlink per-file (real dir, file-level links — works around ultralytics
     # symlink-resolution edge cases we hit with directory-level symlinks).
-    src_imgs = src_root / "test" / "images"
-    src_lbls = src_root / "test" / "labels"
+    src_imgs = src_root / src_split / "images"
+    src_lbls = src_root / src_split / "labels"
     n_img = n_lbl_found = n_lbl_missing = 0
     for im in coco["images"]:
         if int(im["id"]) not in image_ids:
@@ -150,14 +150,21 @@ def materialize_split(name: str, image_ids: set[int],
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data", type=Path, default=Path("ward_v1"),
-                   help="Dataset root (containing test/)")
+                   help="Dataset root (containing the source split)")
+    p.add_argument("--src-split", default="test",
+                   help="Source split under --data to divide (default: test)")
+    p.add_argument("--names", default="real_train,real_test",
+                   help="Output split names '<keep>,<heldout>'; the second "
+                        "receives --test-frac of the images.")
     p.add_argument("--test-frac", type=float, default=0.30,
-                   help="Fraction of real images held out for real_test")
+                   help="Fraction of source images placed in the second "
+                        "(held-out) split")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
+    name_keep, name_held = [s.strip() for s in args.names.split(",")]
     root = args.data.resolve()
-    coco_path = root / "test" / "_annotations.coco.json"
+    coco_path = root / args.src_split / "_annotations.coco.json"
     coco = json.loads(coco_path.read_text())
 
     image_label_sets = defaultdict(set)
@@ -168,14 +175,14 @@ def main():
     image_label_sets = dict(image_label_sets)
 
     train_ids, test_ids = stratified_split(image_label_sets, args.test_frac, args.seed)
-    print(f"split: {len(train_ids)} real_train  |  {len(test_ids)} real_test  "
+    print(f"split: {len(train_ids)} {name_keep}  |  {len(test_ids)} {name_held}  "
           f"(target test_frac={args.test_frac:.2f}, actual={len(test_ids)/len(image_label_sets):.3f})")
 
     cat_id_to_name = {int(c["id"]): c["name"] for c in coco["categories"]}
 
     stats = []
-    for name, ids in (("real_train", train_ids), ("real_test", test_ids)):
-        s = materialize_split(name, ids, coco, root, root, cat_id_to_name)
+    for name, ids in ((name_keep, train_ids), (name_held, test_ids)):
+        s = materialize_split(name, ids, coco, root, root, cat_id_to_name, args.src_split)
         stats.append(s)
         print(f"  {name}: images={s['n_images']}, labels={s['n_labels']} "
               f"(missing={s['n_labels_missing']}), annotations={s['n_anns']}")

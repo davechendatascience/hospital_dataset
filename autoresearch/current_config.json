@@ -1,0 +1,12 @@
+{
+  "version": "r1-baseline",
+  "arch_desc": "Baseline GFN: frozen DINOv2-base, FiLM gate on, 64 gist latents, 2 gist self-attn layers, aux weight 0.5",
+  "flags": [
+    "--backbone", "gfn",
+    "--dino-name", "facebook/dinov2-base",
+    "--freeze-backbone",
+    "--gfn-gate",
+    "--gfn-latents", "64",
+    "--gfn-aux-weight", "0.5"
+  ]
+}
