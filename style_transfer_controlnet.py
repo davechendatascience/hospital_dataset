@@ -98,17 +98,23 @@ class MultiControlStyler:
         dlog.set_verbosity_error()
         dtype = torch.float16 if device.type == "cuda" else torch.float32
         dev_idx = int(args.device) if device.type == "cuda" else -1
+        self.use_depth = not args.no_depth
         self.depth = None
-        if not args.gt_depth:
+        if self.use_depth and not args.gt_depth:
             from transformers import pipeline as hf_pipeline
             print(f"[cnet] depth estimator: {args.depth_model}")
             self.depth = hf_pipeline("depth-estimation", model=args.depth_model, device=dev_idx)
-        else:
+        elif self.use_depth:
             print("[cnet] using ground-truth depth from <split>/depth/")
-        print(f"[cnet] controlnet depth={args.controlnet_depth} seg={args.controlnet_seg} "
-              f"base={args.sd_model}")
-        cn = [ControlNetModel.from_pretrained(args.controlnet_depth, torch_dtype=dtype),
-              ControlNetModel.from_pretrained(args.controlnet_seg, torch_dtype=dtype)]
+        else:
+            print("[cnet] NO depth control -- class-id seg-ControlNet only")
+        print(f"[cnet] controlnet seg={args.controlnet_seg} "
+              f"depth={args.controlnet_depth if self.use_depth else '(off)'} base={args.sd_model}")
+        seg_cn = ControlNetModel.from_pretrained(args.controlnet_seg, torch_dtype=dtype)
+        if self.use_depth:
+            cn = [ControlNetModel.from_pretrained(args.controlnet_depth, torch_dtype=dtype), seg_cn]
+        else:
+            cn = seg_cn                          # single ControlNet (seg only)
         self.pipe = StableDiffusionControlNetPipeline.from_pretrained(
             args.sd_model, controlnet=cn, torch_dtype=dtype,
             safety_checker=None, requires_safety_checker=False)
@@ -127,7 +133,7 @@ class MultiControlStyler:
             print(f"[cnet] IP-Adapter on (scale {args.ip_scale}); "
                   f"{len(self.ip_refs)} real reference images")
         self.args, self.dev, self.labels = args, device, labels
-        self.scales = [args.depth_scale, args.seg_scale]
+        self.scales = [args.depth_scale, args.seg_scale] if self.use_depth else args.seg_scale
         self.palette = class_palette()
 
     def depth_map(self, pil, size, stem=None):
@@ -148,8 +154,12 @@ class MultiControlStyler:
     @torch.no_grad()
     def stylize(self, pil, stem, seed):
         w, h = pil.size
-        depth = self.depth_map(pil, self.args.gen_size, stem)
         seg = self.seg_map(pil, stem, self.args.gen_size)
+        if self.use_depth:
+            depth = self.depth_map(pil, self.args.gen_size, stem)
+            image = [depth, seg]
+        else:
+            depth, image = None, seg         # seg-ControlNet only
         g = torch.Generator(device=self.dev).manual_seed(seed)
         kw = {}
         if self.ip_refs:                    # seeded real reference -> covers the
@@ -157,7 +167,7 @@ class MultiControlStyler:
             kw["ip_adapter_image"] = Image.open(
                 _r.Random(seed).choice(self.ip_refs)).convert("RGB")
         out = self.pipe(prompt=self.args.prompt, negative_prompt=self.args.neg_prompt,
-                        image=[depth, seg], controlnet_conditioning_scale=self.scales,
+                        image=image, controlnet_conditioning_scale=self.scales,
                         num_inference_steps=self.args.steps, guidance_scale=self.args.guidance,
                         generator=g, **kw).images[0]
         return out.resize((w, h), Image.BICUBIC), depth, seg
@@ -207,7 +217,8 @@ def run_preview(styler, files, out_dir, n):
         pil = Image.open(p).convert("RGB")
         styled, depth, seg = styler.stylize(pil, Path(p).stem, 1000 + i)
         w, h = pil.size; canvas = Image.new("RGB", (w * 4, h))
-        for j, im in enumerate([pil, depth.resize(pil.size), seg.resize(pil.size), styled]):
+        dimg = depth.resize(pil.size) if depth is not None else Image.new("RGB", pil.size)
+        for j, im in enumerate([pil, dimg, seg.resize(pil.size), styled]):
             canvas.paste(im, (w * j, 0))
         canvas.save(out_dir / f"{Path(p).stem}_panel.png")
     print(f"[cnet] wrote {min(n, len(files))} previews [sim|depth|seg|styled] -> {out_dir}")
@@ -260,6 +271,8 @@ def parse_args():
     p.add_argument("--depth-model", default="depth-anything/Depth-Anything-V2-Small-hf")
     p.add_argument("--gt-depth", action="store_true", default=False,
                    help="use ground-truth depth from <split>/depth/ instead of estimating")
+    p.add_argument("--no-depth", action="store_true", default=False,
+                   help="no depth control at all -- class-id seg-ControlNet only")
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
     p.add_argument("--neg-prompt", default=DEFAULT_NEG)
     p.add_argument("--gen-size", type=int, default=512)
