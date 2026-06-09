@@ -169,17 +169,21 @@ class PatchNCELoss(nn.Module):
         self.T = nce_T
         self.ce = nn.CrossEntropyLoss(reduction="mean")
 
-    def forward(self, feat_q, feat_k):
-        P, dim = feat_q.shape
+    def forward(self, feat_q, feat_k, num_patches):
+        # feat_*: (B*P, dim), row-major so index = b*P + p. Negatives are the
+        # other patches WITHIN the same image, so reshape to (B, P, dim).
+        N, dim = feat_q.shape
+        B = N // num_patches
         feat_k = feat_k.detach()
-        l_pos = (feat_q * feat_k).sum(1, keepdim=True)              # (P,1) positives
-        # negatives: all other patches in the (single-image) batch
-        q = feat_q.view(1, P, dim)
-        k = feat_k.view(1, P, dim)
-        l_neg = torch.bmm(q, k.transpose(1, 2)).view(P, P)         # (P,P)
-        l_neg.fill_diagonal_(-10.0)
+        l_pos = (feat_q * feat_k).sum(1, keepdim=True)              # (N,1) positives
+        q = feat_q.view(B, num_patches, dim)
+        k = feat_k.view(B, num_patches, dim)
+        l_neg = torch.bmm(q, k.transpose(1, 2))                    # (B,P,P)
+        eye = torch.eye(num_patches, device=q.device, dtype=torch.bool)[None]
+        l_neg.masked_fill_(eye, -10.0)
+        l_neg = l_neg.reshape(N, num_patches)
         logits = torch.cat([l_pos, l_neg], dim=1) / self.T
-        return self.ce(logits, torch.zeros(P, dtype=torch.long, device=feat_q.device))
+        return self.ce(logits, torch.zeros(N, dtype=torch.long, device=q.device))
 
 
 # --------------------------------------------------------------------------- #
@@ -197,13 +201,18 @@ class UnpairedImages(Dataset):
     def __init__(self, sim_dir: Path, real_dir: Path, load: int, crop: int):
         self.sim = list_images(sim_dir)
         self.real = list_images(real_dir)
-        self.tf = transforms.Compose([
-            transforms.Resize(load, antialias=True),
-            transforms.RandomCrop(crop),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5,) * 3, (0.5,) * 3),
-        ])
+        if crop and crop > 0:
+            tf = [transforms.Resize(load, antialias=True),
+                  transforms.RandomCrop(crop)]
+        else:
+            # crop<=0 -> FULL RESOLUTION: use the native image (all 1920x1080,
+            # both dims divisible by 4, so the generator tiles cleanly). batch
+            # must be 1 at this size.
+            tf = []
+        tf += [transforms.RandomHorizontalFlip(),
+               transforms.ToTensor(),
+               transforms.Normalize((0.5,) * 3, (0.5,) * 3)]
+        self.tf = transforms.Compose(tf)
 
     def __len__(self):
         return max(len(self.sim), len(self.real))
@@ -221,6 +230,7 @@ class CUT:
     def __init__(self, args, device):
         self.args = args
         self.dev = device
+        self.amp = getattr(args, "amp", False) and device.type == "cuda"
         self.G = ResnetGenerator().to(device)
         self.D = NLayerDiscriminator().to(device)
         self.F = PatchSampleF(nc=256).to(device)
@@ -230,6 +240,26 @@ class CUT:
         self.opt_G = torch.optim.Adam(self.G.parameters(), lr=args.lr, betas=(0.5, 0.999))
         self.opt_D = torch.optim.Adam(self.D.parameters(), lr=args.lr, betas=(0.5, 0.999))
         self.opt_F = None  # built after F is lazily initialised
+
+        # --- direct distribution loss: MMD in CLIP feature space ----------- #
+        # We minimise MMD between G(sim) and real in CLIP features, NOT DINOv2 —
+        # DINOv2 is the held-out validator, so we never optimise and grade with
+        # the same statistic. CLIP is frozen; gradients flow G -> img -> CLIP.
+        self.lambda_mmd = args.lambda_mmd
+        self.mmd_real_n = args.mmd_real_n
+        self.mmd_sigmas = [0.25, 0.5, 1.0, 2.0, 4.0]   # multi-bandwidth RBF
+        self.clip = None
+        self.real_clip = None                          # cached real CLIP feats
+        if self.lambda_mmd > 0:
+            from transformers import CLIPModel
+            self.clip = CLIPModel.from_pretrained(
+                "openai/clip-vit-base-patch32").to(device).eval()
+            for p in self.clip.parameters():
+                p.requires_grad_(False)
+            self._clip_mean = torch.tensor(
+                [0.48145466, 0.4578275, 0.40821073], device=device)[None, :, None, None]
+            self._clip_std = torch.tensor(
+                [0.26862954, 0.26130258, 0.27577711], device=device)[None, :, None, None]
 
     def gan_loss(self, pred, is_real):  # LSGAN
         target = torch.ones_like(pred) if is_real else torch.zeros_like(pred)
@@ -242,8 +272,48 @@ class CUT:
         q_pool, _ = self.F(feat_q, self.args.num_patches, ids)
         total = 0.0
         for fq, fk, crit in zip(q_pool, k_pool, self.nce):
-            total = total + crit(fq, fk)
+            total = total + crit(fq, fk, self.args.num_patches)
         return total / len(self.layers)
+
+    def clip_embed(self, imgs):
+        """imgs in [-1,1], (B,3,h,w) -> L2-normalised CLIP image features
+        (differentiable; CLIP frozen)."""
+        x = (imgs + 1.0) * 0.5
+        x = F.interpolate(x, size=224, mode="bicubic", align_corners=False)
+        x = (x - self._clip_mean) / self._clip_std
+        # explicit vision_model + projection (version-robust; get_image_features
+        # returns a ModelOutput rather than a tensor in this transformers build)
+        pooled = self.clip.vision_model(pixel_values=x).pooler_output
+        return F.normalize(self.clip.visual_projection(pooled), dim=1)
+
+    @staticmethod
+    def mmd2(x, y, sigmas):
+        """Unbiased multi-bandwidth RBF MMD^2 (diagonal dropped). x carries
+        grad; y (real) is detached. Bandwidth = median heuristic (detached)."""
+        xx = torch.cdist(x, x) ** 2
+        yy = torch.cdist(y, y) ** 2
+        xy = torch.cdist(x, y) ** 2
+        with torch.no_grad():
+            med = torch.median(torch.cat([xx.flatten(), yy.flatten(),
+                                          xy.flatten()])) + 1e-8
+        m, n = x.shape[0], y.shape[0]
+        total = 0.0
+        for s in sigmas:
+            g = 1.0 / (2.0 * s * med)
+            Kxx = torch.exp(-g * xx) - torch.diag(torch.diagonal(torch.exp(-g * xx)))
+            Kyy = torch.exp(-g * yy) - torch.diag(torch.diagonal(torch.exp(-g * yy)))
+            Kxy = torch.exp(-g * xy)
+            total = total + (Kxx.sum() / (m * (m - 1)) + Kyy.sum() / (n * (n - 1))
+                             - 2.0 * Kxy.mean())
+        return total / len(sigmas)
+
+    def mmd_loss(self, fake_B):
+        if self.clip is None or self.real_clip is None:
+            return torch.zeros((), device=fake_B.device)
+        styled = self.clip_embed(fake_B)
+        n = min(self.mmd_real_n, self.real_clip.shape[0])
+        idx = torch.randperm(self.real_clip.shape[0], device=fake_B.device)[:n]
+        return self.mmd2(styled, self.real_clip[idx], self.mmd_sigmas)
 
     def data_dependent_init(self, real_A, real_B):
         """One forward to instantiate F's MLPs, then build its optimizer."""
@@ -255,8 +325,11 @@ class CUT:
 
     def step(self, real_A, real_B):
         a = self.args
-        real = torch.cat([real_A, real_B], 0) if a.nce_idt else real_A
-        fake = self.G(real)
+        ac = torch.autocast(device_type="cuda", dtype=torch.bfloat16,
+                            enabled=self.amp)
+        with ac:
+            real = torch.cat([real_A, real_B], 0) if a.nce_idt else real_A
+            fake = self.G(real)
         fake_B = fake[:real_A.size(0)]
         idt_B = fake[real_A.size(0):] if a.nce_idt else None
 
@@ -264,21 +337,25 @@ class CUT:
         for p in self.D.parameters():
             p.requires_grad_(True)
         self.opt_D.zero_grad()
-        loss_D = 0.5 * (self.gan_loss(self.D(fake_B.detach()), False)
-                        + self.gan_loss(self.D(real_B), True))
+        with ac:
+            loss_D = 0.5 * (self.gan_loss(self.D(fake_B.detach()), False)
+                            + self.gan_loss(self.D(real_B), True))
         loss_D.backward(); self.opt_D.step()
 
         # --- G + F ---
         for p in self.D.parameters():
             p.requires_grad_(False)
         self.opt_G.zero_grad(); self.opt_F.zero_grad()
-        loss_GAN = self.gan_loss(self.D(fake_B), True) * a.lambda_gan
-        loss_NCE = self.calc_nce(real_A, fake_B) * a.lambda_nce
-        if a.nce_idt:
-            loss_NCE = 0.5 * (loss_NCE + self.calc_nce(real_B, idt_B) * a.lambda_nce)
-        loss_G = loss_GAN + loss_NCE
+        with ac:
+            loss_GAN = self.gan_loss(self.D(fake_B), True) * a.lambda_gan
+            loss_NCE = self.calc_nce(real_A, fake_B) * a.lambda_nce
+            if a.nce_idt:
+                loss_NCE = 0.5 * (loss_NCE + self.calc_nce(real_B, idt_B) * a.lambda_nce)
+            loss_MMD = self.mmd_loss(fake_B) * a.lambda_mmd
+            loss_G = loss_GAN + loss_NCE + loss_MMD
         loss_G.backward(); self.opt_G.step(); self.opt_F.step()
-        return {"D": float(loss_D), "G_GAN": float(loss_GAN), "NCE": float(loss_NCE)}
+        return {"D": float(loss_D), "G_GAN": float(loss_GAN),
+                "NCE": float(loss_NCE), "MMD": float(loss_MMD)}
 
     @torch.no_grad()
     def translate(self, pil: Image.Image, short: int) -> Image.Image:
@@ -288,7 +365,9 @@ class CUT:
         nw, nh = (round(w * s) // 4) * 4, (round(h * s) // 4) * 4
         x = transforms.functional.to_tensor(pil.resize((nw, nh), Image.BICUBIC))
         x = ((x - 0.5) / 0.5).unsqueeze(0).to(self.dev)
-        y = self.G(x).squeeze(0).clamp(-1, 1).cpu()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.amp):
+            y = self.G(x)
+        y = y.float().squeeze(0).clamp(-1, 1).cpu()
         y = (y * 0.5 + 0.5)
         out = transforms.functional.to_pil_image(y).resize((w, h), Image.BICUBIC)
         self.G.train()
@@ -386,11 +465,20 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data", type=Path, default=Path("ward_v1"))
+    p.add_argument("--batch", type=int, default=16,
+                   help="Batch size. MMD needs >1 to estimate a distribution; "
+                        "16 @ crop 256 fits and gives a usable MMD per step.")
     p.add_argument("--load", type=int, default=286, help="resize before crop")
     p.add_argument("--crop", type=int, default=256)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--lambda-gan", type=float, default=1.0)
     p.add_argument("--lambda-nce", type=float, default=1.0)
+    p.add_argument("--lambda-mmd", type=float, default=10.0,
+                   help="Weight of the CLIP-feature MMD distribution loss "
+                        "(0 = plain CUT). MMD^2 is small, so it needs a large "
+                        "weight to matter vs GAN/NCE.")
+    p.add_argument("--mmd-real-n", type=int, default=128,
+                   help="Real CLIP features sampled per step for the MMD loss.")
     p.add_argument("--nce-idt", action="store_true", default=True,
                    help="identity NCE on real (CUT default on; FastCUT off)")
     p.add_argument("--nce-layers", default="0,4,8,12,16")
@@ -412,6 +500,9 @@ def parse_args():
     p.add_argument("--patience", type=int, default=4,
                    help="stop after this many evals with no probe-acc improvement")
     p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--amp", action="store_true", default=True,
+                   help="bf16 autocast (faster + less memory; on by default)")
+    p.add_argument("--no-amp", dest="amp", action="store_false")
     p.add_argument("--device", default="0")
     p.add_argument("--project", default="runs/cut")
     p.add_argument("--name", default="ward_v1")
@@ -431,6 +522,10 @@ def main():
     device = (torch.device(f"cuda:{args.device}")
               if torch.cuda.is_available() and args.device != "cpu"
               else torch.device("cpu"))
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True   # constant 1920x1080 -> fastest convs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     if args.apply:
         if not args.weights or not args.weights.is_file():
             raise SystemExit("--apply needs --weights pointing at a trained G .pt")
@@ -443,18 +538,35 @@ def main():
     print(f"[cut] out: {out_dir}  device={device}")
 
     ds = UnpairedImages(args.data / "train", args.data / "test", args.load, args.crop)
-    print(f"[cut] sim={len(ds.sim)} real={len(ds.real)} (epoch = {len(ds)} iters)")
-    loader = DataLoader(ds, batch_size=1, shuffle=True, num_workers=args.workers,
-                        pin_memory=True, drop_last=True)
+    print(f"[cut] sim={len(ds.sim)} real={len(ds.real)}  batch={args.batch}")
+    loader = DataLoader(ds, batch_size=args.batch, shuffle=True,
+                        num_workers=args.workers, pin_memory=True, drop_last=True)
 
     cut = CUT(args, device)
+    if cut.clip is not None:
+        print(f"[cut] caching real CLIP features for the MMD loss "
+              f"({len(ds.real)} imgs, lambda_mmd={args.lambda_mmd}) ...")
+        tf = transforms.Compose([
+            transforms.Resize(args.crop, antialias=True),
+            transforms.CenterCrop(args.crop),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,) * 3, (0.5,) * 3)])
+        feats = []
+        with torch.no_grad():
+            for i in range(0, len(ds.real), 32):
+                b = torch.stack([tf(Image.open(p).convert("RGB"))
+                                 for p in ds.real[i:i + 32]]).to(device)
+                feats.append(cut.clip_embed(b))
+        cut.real_clip = torch.cat(feats, 0)
+        print(f"[cut] real CLIP features: {tuple(cut.real_clip.shape)}")
     print("[cut] building metric (DINOv2) + caching real embeddings ...")
     mdg, embed, real_emb, eval_sim = build_metric(args, device)
     # fixed set of scenes to visualise each epoch (seed != eval, varied scenes)
     sample_files = random.Random(1).sample(ds.sim, min(args.sample_n, len(ds.sim)))
 
     csv_path = out_dir / "metrics.csv"
-    fields = ["epoch", "loss_D", "loss_G_GAN", "loss_NCE", "MMD", "PAD", "probe_acc"]
+    fields = ["epoch", "loss_D", "loss_G_GAN", "loss_NCE", "loss_MMD",
+              "val_MMD", "PAD", "probe_acc"]
     rows = []
     best_acc, since_improve = 1.0, 0
     init_done = False
@@ -462,7 +574,7 @@ def main():
                  else len(loader))
 
     for epoch in range(1, args.max_epochs + 1):
-        agg = {"D": 0.0, "G_GAN": 0.0, "NCE": 0.0}
+        agg = {"D": 0.0, "G_GAN": 0.0, "NCE": 0.0, "MMD": 0.0}
         n = 0
         t0 = time.time()
         for a, b in loader:
@@ -481,12 +593,13 @@ def main():
                 eta = (epoch_len - n) / max(ips, 1e-9)
                 print(f"\r  epoch {epoch} {n}/{epoch_len}  {ips:4.1f} it/s  "
                       f"D={agg['D']/n:.3f} G={agg['G_GAN']/n:.3f} "
-                      f"NCE={agg['NCE']/n:.3f}  ETA {eta:4.0f}s", end="", flush=True)
+                      f"NCE={agg['NCE']/n:.3f} MMD={agg['MMD']/n:.4f}  "
+                      f"ETA {eta:4.0f}s", end="", flush=True)
         print()
         agg = {k: v / max(n, 1) for k, v in agg.items()}
         print(f"[cut] epoch {epoch}/{args.max_epochs}  "
               f"D={agg['D']:.3f} G_GAN={agg['G_GAN']:.3f} NCE={agg['NCE']:.3f} "
-              f"({time.time()-t0:.0f}s)", flush=True)
+              f"MMD={agg['MMD']:.4f} ({time.time()-t0:.0f}s)", flush=True)
 
         if epoch % args.sample_every == 0:
             dump_samples(cut, sample_files, out_dir, epoch, args.eval_short)
@@ -494,13 +607,15 @@ def main():
         if epoch % args.eval_every == 0 or epoch == args.max_epochs:
             m = run_metric(cut, mdg, embed, real_emb, eval_sim,
                            out_dir / "styled_eval", device, args.eval_short)
-            print(f"[cut][metric@{epoch}] MMD={m['MMD']:.4f} PAD={m['PAD']:.3f} "
-                  f"probe_acc={m['probe_acc']:.3f}  (sim->real baseline ~0.986)",
+            print(f"[cut][metric@{epoch}] val_MMD(DINOv2)={m['MMD']:.4f} "
+                  f"PAD={m['PAD']:.3f} probe_acc={m['probe_acc']:.3f}  "
+                  f"(baseline sim->real MMD 0.091/probe 1.000; floor ~0/0.5)",
                   flush=True)
             rows.append({"epoch": epoch, "loss_D": round(agg["D"], 4),
                          "loss_G_GAN": round(agg["G_GAN"], 4),
                          "loss_NCE": round(agg["NCE"], 4),
-                         "MMD": round(m["MMD"], 4), "PAD": round(m["PAD"], 4),
+                         "loss_MMD": round(agg["MMD"], 4),
+                         "val_MMD": round(m["MMD"], 4), "PAD": round(m["PAD"], 4),
                          "probe_acc": round(m["probe_acc"], 4)})
             with open(csv_path, "w", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(rows)
