@@ -118,6 +118,14 @@ class MultiControlStyler:
         if args.lora:
             self.pipe.load_lora_weights(str(args.lora))
             print(f"[cnet] loaded LoRA (real-adapted prior): {args.lora}")
+        self.ip_refs = None
+        if args.ip_adapter:                 # image-prompt: pull appearance toward real refs
+            self.pipe.load_ip_adapter("h94/IP-Adapter", subfolder="models",
+                                      weight_name=args.ip_weight)
+            self.pipe.set_ip_adapter_scale(args.ip_scale)
+            self.ip_refs = list_images(args.ip_ref_dir)
+            print(f"[cnet] IP-Adapter on (scale {args.ip_scale}); "
+                  f"{len(self.ip_refs)} real reference images")
         self.args, self.dev, self.labels = args, device, labels
         self.scales = [args.depth_scale, args.seg_scale]
         self.palette = class_palette()
@@ -143,10 +151,15 @@ class MultiControlStyler:
         depth = self.depth_map(pil, self.args.gen_size, stem)
         seg = self.seg_map(pil, stem, self.args.gen_size)
         g = torch.Generator(device=self.dev).manual_seed(seed)
+        kw = {}
+        if self.ip_refs:                    # seeded real reference -> covers the
+            import random as _r             # whole real set across the dataset
+            kw["ip_adapter_image"] = Image.open(
+                _r.Random(seed).choice(self.ip_refs)).convert("RGB")
         out = self.pipe(prompt=self.args.prompt, negative_prompt=self.args.neg_prompt,
                         image=[depth, seg], controlnet_conditioning_scale=self.scales,
                         num_inference_steps=self.args.steps, guidance_scale=self.args.guidance,
-                        generator=g).images[0]
+                        generator=g, **kw).images[0]
         return out.resize((w, h), Image.BICUBIC), depth, seg
 
 
@@ -236,6 +249,12 @@ def parse_args():
     p.add_argument("--split", default="train")
     p.add_argument("--sd-model", default="sd-legacy/stable-diffusion-v1-5")
     p.add_argument("--lora", type=Path, default=None, help="LoRA weights dir (train_lora_real.py)")
+    p.add_argument("--ip-adapter", action="store_true", default=False,
+                   help="image-prompt conditioning on real references (no training)")
+    p.add_argument("--ip-ref-dir", type=Path, default=Path("ward_v1/real_train"),
+                   help="real images used as IP-Adapter references")
+    p.add_argument("--ip-scale", type=float, default=0.6)
+    p.add_argument("--ip-weight", default="ip-adapter_sd15.bin")
     p.add_argument("--controlnet-depth", default="lllyasviel/sd-controlnet-depth")
     p.add_argument("--controlnet-seg", default="lllyasviel/sd-controlnet-seg")
     p.add_argument("--depth-model", default="depth-anything/Depth-Anything-V2-Small-hf")
