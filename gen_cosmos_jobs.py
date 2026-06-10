@@ -19,10 +19,35 @@ import argparse
 import csv
 import json
 import os
+import random
 from pathlib import Path
 
 import numpy as np
-import torch
+
+# realistic lighting/time modifiers appended to the prompt for style variance
+STYLE_MODIFIERS = [
+    "bright natural daylight from the window",
+    "soft overcast daylight",
+    "warm late-afternoon light",
+    "cool early-morning light",
+    "even fluorescent ceiling lighting",
+    "dim evening lighting with the ceiling lights on",
+]
+
+# scene classification from COCO object NAMES (shared by sim frames + test refs)
+WARD_OBJ = {"hospital_bed", "bed_curtain", "overbed_table", "bedside_monitor"}
+BATH_OBJ = {"toilet", "toilet_handle", "shower", "sink", "mirror"}
+BIN_OBJ = {"soiled_linen_bin", "waste_bin", "medical_waste_container"}
+
+
+def scene_of(names: set) -> str:
+    if names & WARD_OBJ:          # a bed dominates -> ward
+        return "ward"
+    if names & BATH_OBJ:          # no bed + bathroom fixture
+        return "bathroom"
+    if names & BIN_OBJ:           # no bed + bins
+        return "corridor"
+    return "ward"
 
 PROJECT = Path(__file__).resolve().parent
 TEST = PROJECT / "ward_v3" / "test" / "images"
@@ -41,7 +66,7 @@ ROOMS = [
                    "articulated arm, a white louvered air-conditioner, a UV germicidal lamp, a "
                    "beige wall telephone, a white bedside cabinet, a mint-green privacy curtain, "
                    "cream and beige walls with wood-grain laminate wainscot, light wood laminate "
-                   "floor, a window with sheer curtains, soft natural daylight."),
+                   "floor, a window with sheer curtains."),
     },
     {
         "name": "corridor",
@@ -50,7 +75,7 @@ ROOMS = [
                    "stainless-steel rolling soiled-linen bin holding a fabric laundry bag, and a "
                    "cream pedal-operated biomedical-waste bin with a red plastic liner and a "
                    "biohazard label, beside wood-grain laminate wall panels and a sliding door, "
-                   "light wood laminate floor, cream walls, soft indoor lighting."),
+                   "light wood laminate floor, cream walls."),
     },
     {
         "name": "bathroom",
@@ -59,7 +84,7 @@ ROOMS = [
                    "square ceramic wall tiles and beige floor tiles, a white toilet, "
                    "stainless-steel L-shaped and flip-up grab bars, a chrome toilet-paper "
                    "holder, a wall-mounted ceramic sink with a chrome faucet and a framed "
-                   "mirror, red nurse-call buttons, soft daylight."),
+                   "mirror, red nurse-call buttons."),
     },
 ]
 
@@ -85,6 +110,11 @@ def main():
                          "Set 0 to disable depth control.")
     ap.add_argument("--depth-dir", type=Path, default=None,
                     help="dir of depth PNGs (default <sim-dir>/../depth).")
+    ap.add_argument("--vary-style", action="store_true", default=False,
+                    help="style variance (deterministic by stem): per-image random real "
+                         "style-ref from the scene pool + random seed + a lighting modifier.")
+    ap.add_argument("--test-dir", type=Path, default=PROJECT / "ward_v3/test",
+                    help="real test set (with COCO) -> per-scene style-reference pools.")
     ap.add_argument("--captions", type=Path, default=None,
                     help="JSON {stem: prompt} from caption_images.py -> per-image prompt "
                          "(falls back to the room template prompt if a stem is missing).")
@@ -123,21 +153,29 @@ def main():
 
     # label-based scene classifier (ward / corridor / bathroom) from the sim COCO
     nm = {c["id"]: c["name"] for c in coco.dataset["categories"]}
-    TOILET = {i for i, n in nm.items() if n in ("toilet", "toilet_handle", "shower")}
-    SINKMIR = {i for i, n in nm.items() if n in ("sink", "mirror")}
-    BINS = {i for i, n in nm.items() if n in ("soiled_linen_bin", "waste_bin", "medical_waste_container")}
-    BED = {i for i, n in nm.items() if n in ("hospital_bed", "bed_curtain", "overbed_table", "bedside_monitor")}
     ROOM_IDX = {r["name"]: k for k, r in enumerate(ROOMS)}
 
     def classify(img_id):
-        s = {a["category_id"] for a in coco.imgToAnns.get(img_id, [])}
-        if s & BED:                               # a bed dominates the frame -> ward
-            return "ward"                         # (even if a toilet door is visible)
-        if s & (TOILET | SINKMIR):                # no bed + bathroom fixture
-            return "bathroom"
-        if s & BINS:                              # no bed + bins
-            return "corridor"
-        return "ward"
+        names = {nm[a["category_id"]] for a in coco.imgToAnns.get(img_id, [])}
+        return scene_of(names)
+
+    # per-scene REAL style-reference pools: single rep by default; full pool if --vary-style
+    ref_pools = {r["name"]: [str(Path(r["ref"]).resolve())] for r in ROOMS}
+    if args.vary_style:
+        tcoco = COCO(str(args.test_dir / "_annotations.coco.json"))
+        tnm = {c["id"]: c["name"] for c in tcoco.dataset["categories"]}
+        timg = args.test_dir / "images"
+        pools = {"ward": [], "corridor": [], "bathroom": []}
+        for tid, tim in tcoco.imgs.items():
+            names = {tnm[a["category_id"]] for a in tcoco.imgToAnns.get(tid, [])}
+            fp = timg / tim["file_name"]
+            if fp.is_file():
+                pools[scene_of(names)].append(str(fp.resolve()))
+        for k, v in pools.items():
+            if v:
+                ref_pools[k] = v
+        print("[cosmos-jobs] style-ref pools: " +
+              ", ".join(f"{k}={len(ref_pools[k])}" for k in ("ward", "corridor", "bathroom")))
 
     cfg_dir = args.out / "configs"; seg_dir = args.out / "seg"
     cfg_dir.mkdir(parents=True, exist_ok=True); seg_dir.mkdir(parents=True, exist_ok=True)
@@ -147,9 +185,17 @@ def main():
         stem = Path(p).stem
         ri = ROOM_IDX[classify(stem2id.get(stem))]
         room = ROOMS[ri]; counts[ri] += 1
+        rng = random.Random(stem)                   # deterministic per-image variance
         prompt = caps.get(stem, room["prompt"])     # per-image caption, else scene-type prompt
         if stem in caps:
             n_cap += 1
+        ref = str(Path(room["ref"]).resolve())
+        seed = args.seed
+        if args.vary_style:                         # sample real ref + seed + lighting
+            ref = rng.choice(ref_pools[room["name"]])
+            seed = rng.randrange(1, 1_000_000)
+            if stem not in caps:
+                prompt = f"{prompt} {rng.choice(STYLE_MODIFIERS)}."
         controls = {}
         img_id = stem2id.get(stem)
         if img_id is not None:                      # SEG (label) control map
@@ -172,8 +218,8 @@ def main():
             "prompt": prompt,
             "video_path": str(Path(p).resolve()),     # single image
             "max_frames": 1, "num_video_frames_per_chunk": 1,
-            "image_context_path": str(Path(room["ref"]).resolve()),
-            "seed": args.seed,
+            "image_context_path": ref,
+            "seed": seed,
             **controls,
         }
         (cfg_dir / f"{stem}.json").write_text(json.dumps(cfg, indent=2))
