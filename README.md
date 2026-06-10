@@ -135,7 +135,9 @@ the DINOv2/CLIP gap is a guide, not the endpoint.
   — detector/segmentor variants and inference.
 - `inspect_stage.py`, `inspect_ward.sh`, `debug_campose.py` — render/scene inspection.
 - `autoresearch/` — earlier global‑first‑backbone research loop. `experiments/` — MNIST domain‑shift probes.
-- `docs/` — Cosmos/Replicator setup notes, global‑first architecture, sim2real findings.
+- `docs/` — **[cosmos-transfer-sim2real.md](docs/cosmos-transfer-sim2real.md)** (current Cosmos
+  approach, breakthroughs & the recipe), Cosmos/Replicator setup notes, global‑first architecture,
+  sim2real findings.
 
 ## Status
 Cosmos‑Transfer2.5 is installed and validated end‑to‑end; `cosmos_jobs/` holds the 2700
