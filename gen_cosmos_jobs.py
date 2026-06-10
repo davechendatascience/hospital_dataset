@@ -53,36 +53,14 @@ PROJECT = Path(__file__).resolve().parent
 TEST = PROJECT / "ward_v3" / "test" / "images"
 COSMOS_REPO = Path("/home/edge-host/cosmos-transfer2.5")
 
-# 3 scene types: WARD room, CORRIDOR (utility nook with two bins), BATHROOM.
-# Each = representative real photo (style ref) + scene phrase + materials/style.
-# The OBJECT LIST is built per-frame from that frame's COCO labels (so Cosmos is
-# told the actual objects present, e.g. "overbed table" not a generic "cabinet").
-ROOMS = [
-    {
-        "name": "ward",
-        "ref": TEST / "WIN_20260331_11_10_31_Pro_frame_00630_png.rf.75d81cbd26be74104e3509f5df918c1f.jpg",
-        "phrase": "ward patient room",
-        "materials": ("a deep purple-navy mattress with white plastic bed rails, mint-green "
-                      "privacy curtains, stainless-steel equipment, cream and beige walls with "
-                      "wood-grain laminate wainscot, light wood laminate floor"),
-    },
-    {
-        "name": "corridor",
-        "ref": TEST / "WIN_20260331_12_10_38_Pro_frame_00625_png.rf.232c56cd353d169117ca36485026ff84.jpg",
-        "phrase": "corridor and utility area",
-        "materials": ("wood-grain laminate wall panels and a sliding door, light wood laminate "
-                      "floor, cream walls"),
-    },
-    {
-        "name": "bathroom",
-        "ref": TEST / "WIN_20260331_11_26_06_Pro_frame_04423_png.rf.ebcab57482d5df6214098c18da6fce1a.jpg",
-        "phrase": "ensuite bathroom",
-        "materials": ("white square ceramic wall tiles, beige floor tiles, white ceramic "
-                      "fixtures, stainless-steel grab bars"),
-    },
-]
+# Scene-agnostic: the seg+depth controls + the guided foreground mask define the
+# actual scene (ward/corridor/bathroom), so we DON'T classify it ourselves (that was
+# error-prone). The prompt lists the frame's real objects (from COCO labels); the
+# style ref is content-matched from the real set by object inventory.
+SHARED_MATERIALS = ("cream and beige walls with wood-grain laminate wainscot or white "
+                    "ceramic wall tiles, light wood-laminate or tiled floors, stainless-steel "
+                    "and white fixtures, mint-green privacy curtains, soft natural lighting")
 
-# class-name -> readable phrase for the prompt object list
 _ACRONYM = {"iv": "IV", "tv": "TV", "uv": "UV"}
 
 
@@ -90,12 +68,12 @@ def _humanize(name: str) -> str:
     return " ".join(_ACRONYM.get(w, w) for w in name.split("_"))
 
 
-def build_prompt(room: dict, class_names: set) -> str:
-    """Scene-type framing + the ACTUAL objects in this frame (from COCO labels)."""
+def build_prompt(class_names: set) -> str:
+    """Scene-agnostic framing + the ACTUAL objects in this frame (from COCO labels)."""
     objs = sorted(_humanize(n) for n in class_names if n and n != "ward_object")
     obj_str = ", ".join(objs) if objs else "hospital equipment"
-    return (f"A realistic photograph of a Taiwanese hospital {room['phrase']}, with "
-            f"{obj_str}; {room['materials']}, soft natural lighting.")
+    return (f"A realistic photograph of a Taiwanese hospital interior, with "
+            f"{obj_str}; {SHARED_MATERIALS}.")
 
 
 def list_images(d: Path):
@@ -111,10 +89,10 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sim-dir", type=Path, default=PROJECT / "ward_v3/train/images")
     ap.add_argument("--out", type=Path, default=PROJECT / "cosmos_jobs")
-    ap.add_argument("--seg-weight", type=float, default=1.0,
+    ap.add_argument("--seg-weight", type=float, default=0.6,
                     help="seg (label) control weight; feeds the class-id seg map rasterized "
                          "from the sim COCO -> preserves object regions on the output.")
-    ap.add_argument("--depth-weight", type=float, default=0.5,
+    ap.add_argument("--depth-weight", type=float, default=0.8,
                     help="depth control weight; feeds ground-truth Isaac depth -> geometry. "
                          "Set 0 to disable depth control.")
     ap.add_argument("--depth-dir", type=Path, default=None,
@@ -123,8 +101,13 @@ def main():
                     help="guided generation: anchor the labeled foreground (union of object "
                          "masks) during denoising so object structure/identity is preserved.")
     ap.add_argument("--no-guided", dest="guided", action="store_false")
-    ap.add_argument("--guided-steps", type=int, default=25,
-                    help="guided_generation_step_threshold (higher = stronger foreground anchor).")
+    ap.add_argument("--guided-steps", type=int, default=10,
+                    help="guided_generation_step_threshold out of ~35 (anchor structure early, "
+                         "release for restyle late). ~10 balances anchoring + realism.")
+    ap.add_argument("--edge-weight", type=float, default=1.0,
+                    help="edge control weight (computed on the fly; contours without color).")
+    ap.add_argument("--guidance", type=float, default=3.0,
+                    help="classifier-free guidance (modest so structure isn't overpowered).")
     ap.add_argument("--vary-style", action="store_true", default=False,
                     help="style variance (deterministic by stem): per-image random real "
                          "style-ref from the scene pool + random seed + a lighting modifier.")
@@ -141,12 +124,8 @@ def main():
     sim_files = list_images(args.sim_dir)
     if args.limit:
         sim_files = sim_files[:args.limit]
-    for r in ROOMS:
-        if not Path(r["ref"]).is_file():
-            raise SystemExit(f"missing room reference image: {r['ref']}")
-
-    # Scene assignment is by the sim's OWN COCO labels (reliable) -- NOT DINOv2 nearest
-    # real-ref (sim != real in DINOv2 space, so it misclassifies). classify() below.
+    # Scene is NOT classified here -- the seg+depth controls + the guided foreground
+    # mask define the actual scene; the style ref is content-matched by object inventory.
 
     caps = {}
     if args.captions and Path(args.captions).is_file():
@@ -166,54 +145,50 @@ def main():
     stem2id = {Path(im["file_name"]).stem: i for i, im in coco.imgs.items()}
     depth_dir = args.depth_dir or (args.sim_dir.parent / "depth")
 
-    # label-based scene classifier (ward / corridor / bathroom) from the sim COCO
     nm = {c["id"]: c["name"] for c in coco.dataset["categories"]}
-    ROOM_IDX = {r["name"]: k for k, r in enumerate(ROOMS)}
 
-    def classify(img_id):
-        names = {nm[a["category_id"]] for a in coco.imgToAnns.get(img_id, [])}
-        return scene_of(names)
+    # real style-reference index: each real test photo -> its object-class set, so each sim
+    # frame is content-matched to the real photo whose objects best match (Jaccard) -- no
+    # brittle scene classification; the seg+depth controls + guided mask define the scene.
+    tcoco = COCO(str(args.test_dir / "_annotations.coco.json"))
+    tnm = {c["id"]: c["name"] for c in tcoco.dataset["categories"]}
+    timg = args.test_dir / "images"
+    real_refs = []
+    for tid, tim in tcoco.imgs.items():
+        names = frozenset(tnm[a["category_id"]] for a in tcoco.imgToAnns.get(tid, [])
+                          if a["category_id"] != 0)
+        fp = timg / tim["file_name"]
+        if fp.is_file():
+            real_refs.append((str(fp.resolve()), names))
+    print(f"[cosmos-jobs] {len(real_refs)} real style refs (content-matched by object inventory)")
 
-    # per-scene REAL style-reference pools: single rep by default; full pool if --vary-style
-    ref_pools = {r["name"]: [str(Path(r["ref"]).resolve())] for r in ROOMS}
-    if args.vary_style:
-        tcoco = COCO(str(args.test_dir / "_annotations.coco.json"))
-        tnm = {c["id"]: c["name"] for c in tcoco.dataset["categories"]}
-        timg = args.test_dir / "images"
-        pools = {"ward": [], "corridor": [], "bathroom": []}
-        for tid, tim in tcoco.imgs.items():
-            names = {tnm[a["category_id"]] for a in tcoco.imgToAnns.get(tid, [])}
-            fp = timg / tim["file_name"]
-            if fp.is_file():
-                pools[scene_of(names)].append(str(fp.resolve()))
-        for k, v in pools.items():
-            if v:
-                ref_pools[k] = v
-        print("[cosmos-jobs] style-ref pools: " +
-              ", ".join(f"{k}={len(ref_pools[k])}" for k in ("ward", "corridor", "bathroom")))
+    def match_refs(present, k=8):
+        def jac(s):
+            u = len(present | s)
+            return (len(present & s) / u) if u else 0.0
+        return [r[0] for r in sorted(real_refs, key=lambda x: jac(x[1]), reverse=True)[:k]]
 
     cfg_dir = args.out / "configs"; seg_dir = args.out / "seg"; depth_out = args.out / "depth"
     fg_dir = args.out / "fgmask"
     for d in (cfg_dir, seg_dir, depth_out, fg_dir):
         d.mkdir(parents=True, exist_ok=True)
     out_root = (args.out / "outputs").resolve()
-    manifest, counts, n_cap, n_seg, n_depth, n_guided = [], [0, 0, 0], 0, 0, 0, 0
+    manifest, n_cap, n_seg, n_depth, n_guided = [], 0, 0, 0, 0
     for p in sim_files:
         stem = Path(p).stem
         img_id = stem2id.get(stem)
         present = {nm[a["category_id"]] for a in coco.imgToAnns.get(img_id, [])
                    if a["category_id"] != 0}          # actual object classes in this frame
-        ri = ROOM_IDX[scene_of(present)]
-        room = ROOMS[ri]; counts[ri] += 1
         rng = random.Random(stem)                   # deterministic per-image variance
-        # prompt names the ACTUAL objects (from labels) so Cosmos renders the right ones
-        prompt = caps.get(stem) or build_prompt(room, present)
+        # prompt names the ACTUAL objects (from labels); scene-agnostic framing
+        prompt = caps.get(stem) or build_prompt(present)
         if stem in caps:
             n_cap += 1
-        ref = str(Path(room["ref"]).resolve())
+        cand = match_refs(present)                  # top-K content-matched real refs
+        ref = cand[0]
         seed = args.seed
-        if args.vary_style:                         # sample real ref + seed + lighting
-            ref = rng.choice(ref_pools[room["name"]])
+        if args.vary_style:                         # vary among matched refs + seed + lighting
+            ref = rng.choice(cand)
             seed = rng.randrange(1, 1_000_000)
             prompt = f"{prompt} {rng.choice(STYLE_MODIFIERS)}."
         controls = {}
@@ -246,23 +221,26 @@ def main():
             controls["depth"] = {"control_path": str(d3),
                                  "control_weight": args.depth_weight}
             n_depth += 1
+        if args.edge_weight > 0:                     # EDGE control (computed on the fly)
+            controls["edge"] = {"control_weight": args.edge_weight}
         cfg = {
-            "name": f"{room['name']}_{stem}",
+            "name": stem,
             "prompt": prompt,
             "video_path": str(Path(p).resolve()),     # single image
             "max_frames": 1, "num_video_frames_per_chunk": 1,
             "image_context_path": ref,
+            "guidance": args.guidance,
             "seed": seed,
             **controls,
             **guided,
         }
         (cfg_dir / f"{stem}.json").write_text(json.dumps(cfg, indent=2))
-        manifest.append({"stem": stem, "room": room["name"], "config": str(cfg_dir / f"{stem}.json")})
+        manifest.append({"stem": stem, "ref": Path(ref).name, "config": str(cfg_dir / f"{stem}.json")})
 
     with open(args.out / "manifest.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["stem", "room", "config"]); w.writeheader(); w.writerows(manifest)
-    print(f"[cosmos-jobs] controls: seg={n_seg} (w={args.seg_weight}), "
-          f"depth={n_depth} (w={args.depth_weight}), "
+        w = csv.DictWriter(f, fieldnames=["stem", "ref", "config"]); w.writeheader(); w.writerows(manifest)
+    print(f"[cosmos-jobs] controls: seg={n_seg} (w={args.seg_weight}), depth={n_depth} "
+          f"(w={args.depth_weight}), edge (w={args.edge_weight}), guidance={args.guidance}, "
           f"guided-fg-mask={n_guided} (steps={args.guided_steps})")
 
     # BATCH runner: pass ALL configs to one inference.py call so the 7B model is
@@ -278,9 +256,7 @@ def main():
     run.chmod(0o755)
 
     print(f"[cosmos-jobs] {len(sim_files)} images -> {cfg_dir}  "
-          f"(prompts: {n_cap} per-image caption, {len(sim_files)-n_cap} room-template)")
-    print(f"[cosmos-jobs] room assignment (image_context_path style ref): " +
-          ", ".join(f"{ROOMS[i]['name']}={counts[i]}" for i in range(3)))
+          f"(prompts: {n_cap} caption, {len(sim_files)-n_cap} object-list; refs content-matched)")
     print(f"[cosmos-jobs] outputs -> {out_root}")
     print(f"[cosmos-jobs] run all:  bash {run}")
 
