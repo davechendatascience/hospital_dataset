@@ -243,16 +243,26 @@ def main():
           f"(w={args.depth_weight}), edge (w={args.edge_weight}), guidance={args.guidance}, "
           f"guided-fg-mask={n_guided} (steps={args.guided_steps})")
 
-    # BATCH runner: pass ALL configs to one inference.py call so the 7B model is
-    # loaded ONCE and every image runs sequentially (each with its own prompt).
-    # (-i accepts multiple param files -> batch inference, per inference.py --help.)
+    # RESUMABLE batch runner: each pass runs inference (model loaded once) on the configs
+    # whose output jpg doesn't exist yet; if a frame aborts the batch, the loop restarts
+    # on the remaining ones. So a crash mid-run only costs one model reload, not progress.
     run = args.out / "run_all.sh"
     run.write_text(
         "#!/usr/bin/env bash\n"
-        "# Cosmos-Transfer2.5 batch: model loaded once, every image (own prompt) in turn.\n"
-        f"set -e\ncd {COSMOS_REPO}\n"
-        f'./.venv/bin/python examples/inference.py -i {cfg_dir.resolve()}/*.json '
-        f'-o {out_root}\n')
+        "# Cosmos-Transfer2.5 RESUMABLE batch (skips already-rendered frames).\n"
+        f"cd {COSMOS_REPO}\n"
+        f'CFGDIR="{cfg_dir.resolve()}"; OUT="{out_root}"; mkdir -p "$OUT"\n'
+        "while :; do\n"
+        "  todo=()\n"
+        '  for c in "$CFGDIR"/*.json; do\n'
+        '    n=$(basename "$c" .json)\n'
+        '    [ -f "$OUT/$n.jpg" ] || todo+=("$c")\n'
+        "  done\n"
+        '  [ ${#todo[@]} -eq 0 ] && { echo "[run_all] all rendered."; break; }\n'
+        '  echo "[run_all] $(date +%H:%M:%S) rendering ${#todo[@]} remaining frames ..."\n'
+        '  ./.venv/bin/python examples/inference.py -i "${todo[@]}" -o "$OUT" \\\n'
+        '    || echo "[run_all] batch aborted on a frame; resuming remaining ..."\n'
+        "done\n")
     run.chmod(0o755)
 
     print(f"[cosmos-jobs] {len(sim_files)} images -> {cfg_dir}  "
