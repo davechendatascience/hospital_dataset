@@ -53,40 +53,49 @@ PROJECT = Path(__file__).resolve().parent
 TEST = PROJECT / "ward_v3" / "test" / "images"
 COSMOS_REPO = Path("/home/edge-host/cosmos-transfer2.5")
 
-# 3 scene types in the footage: WARD room, CORRIDOR (utility nook with two bins),
-# BATHROOM. Each: representative real photo (style ref, from ward_v3/test) + a
-# scene-type prompt. Sim images are assigned to the nearest ref by DINOv2.
+# 3 scene types: WARD room, CORRIDOR (utility nook with two bins), BATHROOM.
+# Each = representative real photo (style ref) + scene phrase + materials/style.
+# The OBJECT LIST is built per-frame from that frame's COCO labels (so Cosmos is
+# told the actual objects present, e.g. "overbed table" not a generic "cabinet").
 ROOMS = [
     {
         "name": "ward",
         "ref": TEST / "WIN_20260331_11_10_31_Pro_frame_00630_png.rf.75d81cbd26be74104e3509f5df918c1f.jpg",
-        "prompt": ("A realistic photograph of a Taiwanese hospital ward patient room: an "
-                   "electric care bed with a deep purple-navy mattress and white plastic side "
-                   "rails, a stainless-steel IV pole, a wall-mounted vital-signs monitor on an "
-                   "articulated arm, a white louvered air-conditioner, a UV germicidal lamp, a "
-                   "beige wall telephone, a white bedside cabinet, a mint-green privacy curtain, "
-                   "cream and beige walls with wood-grain laminate wainscot, light wood laminate "
-                   "floor, a window with sheer curtains."),
+        "phrase": "ward patient room",
+        "materials": ("a deep purple-navy mattress with white plastic bed rails, mint-green "
+                      "privacy curtains, stainless-steel equipment, cream and beige walls with "
+                      "wood-grain laminate wainscot, light wood laminate floor"),
     },
     {
         "name": "corridor",
         "ref": TEST / "WIN_20260331_12_10_38_Pro_frame_00625_png.rf.232c56cd353d169117ca36485026ff84.jpg",
-        "prompt": ("A realistic photograph of a Taiwanese hospital corridor and utility nook: a "
-                   "stainless-steel rolling soiled-linen bin holding a fabric laundry bag, and a "
-                   "cream pedal-operated biomedical-waste bin with a red plastic liner and a "
-                   "biohazard label, beside wood-grain laminate wall panels and a sliding door, "
-                   "light wood laminate floor, cream walls."),
+        "phrase": "corridor and utility area",
+        "materials": ("wood-grain laminate wall panels and a sliding door, light wood laminate "
+                      "floor, cream walls"),
     },
     {
         "name": "bathroom",
         "ref": TEST / "WIN_20260331_11_26_06_Pro_frame_04423_png.rf.ebcab57482d5df6214098c18da6fce1a.jpg",
-        "prompt": ("A realistic photograph of a Taiwanese hospital ward ensuite bathroom: white "
-                   "square ceramic wall tiles and beige floor tiles, a white toilet, "
-                   "stainless-steel L-shaped and flip-up grab bars, a chrome toilet-paper "
-                   "holder, a wall-mounted ceramic sink with a chrome faucet and a framed "
-                   "mirror, red nurse-call buttons."),
+        "phrase": "ensuite bathroom",
+        "materials": ("white square ceramic wall tiles, beige floor tiles, white ceramic "
+                      "fixtures, stainless-steel grab bars"),
     },
 ]
+
+# class-name -> readable phrase for the prompt object list
+_ACRONYM = {"iv": "IV", "tv": "TV", "uv": "UV"}
+
+
+def _humanize(name: str) -> str:
+    return " ".join(_ACRONYM.get(w, w) for w in name.split("_"))
+
+
+def build_prompt(room: dict, class_names: set) -> str:
+    """Scene-type framing + the ACTUAL objects in this frame (from COCO labels)."""
+    objs = sorted(_humanize(n) for n in class_names if n and n != "ward_object")
+    obj_str = ", ".join(objs) if objs else "hospital equipment"
+    return (f"A realistic photograph of a Taiwanese hospital {room['phrase']}, with "
+            f"{obj_str}; {room['materials']}, soft natural lighting.")
 
 
 def list_images(d: Path):
@@ -184,10 +193,14 @@ def main():
     manifest, counts, n_cap, n_seg, n_depth = [], [0, 0, 0], 0, 0, 0
     for p in sim_files:
         stem = Path(p).stem
-        ri = ROOM_IDX[classify(stem2id.get(stem))]
+        img_id = stem2id.get(stem)
+        present = {nm[a["category_id"]] for a in coco.imgToAnns.get(img_id, [])
+                   if a["category_id"] != 0}          # actual object classes in this frame
+        ri = ROOM_IDX[scene_of(present)]
         room = ROOMS[ri]; counts[ri] += 1
         rng = random.Random(stem)                   # deterministic per-image variance
-        prompt = caps.get(stem, room["prompt"])     # per-image caption, else scene-type prompt
+        # prompt names the ACTUAL objects (from labels) so Cosmos renders the right ones
+        prompt = caps.get(stem) or build_prompt(room, present)
         if stem in caps:
             n_cap += 1
         ref = str(Path(room["ref"]).resolve())
@@ -195,10 +208,8 @@ def main():
         if args.vary_style:                         # sample real ref + seed + lighting
             ref = rng.choice(ref_pools[room["name"]])
             seed = rng.randrange(1, 1_000_000)
-            if stem not in caps:
-                prompt = f"{prompt} {rng.choice(STYLE_MODIFIERS)}."
+            prompt = f"{prompt} {rng.choice(STYLE_MODIFIERS)}."
         controls = {}
-        img_id = stem2id.get(stem)
         if img_id is not None:                      # SEG (label) control map
             info = coco.imgs[img_id]; H, W = info["height"], info["width"]
             seg = np.zeros((H, W, 3), np.uint8)
