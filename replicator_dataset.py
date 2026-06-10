@@ -94,7 +94,14 @@ def parse_args():
                         "multimodal control data (rgb/depth/segmentation/edges/"
                         "shaded_seg + mp4s) for NVIDIA Cosmos-Transfer sim2real, with "
                         "use_instance_id=True for cross-frame object identity. Skips "
-                        "the COCO post-step (Cosmos output is clip-structured).")
+                        "the COCO post-step (Cosmos output is clip-structured). "
+                        "Implies --trajectory (Cosmos is a video model).")
+    p.add_argument("--trajectory", action="store_true", default=False,
+                   help="Render a SMOOTH camera fly-through (Catmull-Rom spline through "
+                        "valid keyframe poses) instead of independent random poses, so "
+                        "frames form a temporally-coherent clip. Auto-on with --cosmos.")
+    p.add_argument("--traj-keys", type=int, default=6,
+                   help="Number of valid keyframe poses anchoring the trajectory spline.")
     return p.parse_args()
 
 
@@ -1000,19 +1007,66 @@ def sample_camera_pose(rng):
     return pos, look, accepted
 
 
+def _catmull_rom(points, n):
+    """Smooth Catmull-Rom spline through `points` (list of 3-tuples) -> n samples
+    that pass through the keyframes (C1-continuous, no corners)."""
+    import numpy as _np
+    pts = _np.asarray(points, float)
+    if len(pts) == 1:
+        return [tuple(float(v) for v in pts[0])] * n
+    P = _np.vstack([pts[0], pts, pts[-1]])      # pad ends so the spline hits them
+    segs = len(pts) - 1
+    out = []
+    for i in range(n):
+        u = (i / max(n - 1, 1)) * segs
+        s = min(int(u), segs - 1)
+        t = u - s
+        p0, p1, p2, p3 = P[s], P[s + 1], P[s + 2], P[s + 3]
+        t2, t3 = t * t, t * t * t
+        pt = 0.5 * ((2 * p1) + (-p0 + p2) * t
+                    + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
+                    + (-p0 + 3 * p1 - 3 * p2 + p3) * t3)
+        out.append(tuple(float(v) for v in pt))
+    return out
+
+
+def sample_camera_trajectory(rng, n_frames, n_keys):
+    """Smooth camera fly-through: sample n_keys VALID keyframe poses (reusing
+    sample_camera_pose's room/occlusion/line-of-sight checks) and Catmull-Rom
+    interpolate position + look-at over n_frames. Temporally-coherent clip for
+    video models (Cosmos-Transfer) instead of jumpy independent poses."""
+    key_pos, key_look, tries = [], [], 0
+    while len(key_pos) < n_keys and tries < n_keys * 80:
+        tries += 1
+        p, t, ok = sample_camera_pose(rng)
+        if ok and p is not None:
+            key_pos.append(p); key_look.append(t)
+    while len(key_pos) < 2:                     # guarantee a spline is possible
+        p, t, _ = sample_camera_pose(rng)
+        key_pos.append(p); key_look.append(t)
+    print(f"[camera][trajectory] {len(key_pos)} valid keyframes -> "
+          f"{n_frames}-frame Catmull-Rom fly-through")
+    return _catmull_rom(key_pos, n_frames), _catmull_rom(key_look, n_frames)
+
+
 rng = random.Random(args.seed)
-camera_positions = []
-camera_targets   = []
-_n_fallback = 0
-for _ in range(args.frames):
-    p, t, ok = sample_camera_pose(rng)
-    camera_positions.append(p)
-    camera_targets.append(t)
-    if not ok:
-        _n_fallback += 1
-print(f"[camera] {args.frames - _n_fallback}/{args.frames} poses passed all "
-      f"placement checks; {_n_fallback} fell back to an unchecked sample "
-      f"(high fallback count -> no-go volumes are over-rejecting)")
+if args.trajectory or args.cosmos:
+    # Smooth fly-through -> temporally-coherent clip for Cosmos-Transfer (video).
+    camera_positions, camera_targets = sample_camera_trajectory(
+        rng, args.frames, args.traj_keys)
+else:
+    camera_positions = []
+    camera_targets   = []
+    _n_fallback = 0
+    for _ in range(args.frames):
+        p, t, ok = sample_camera_pose(rng)
+        camera_positions.append(p)
+        camera_targets.append(t)
+        if not ok:
+            _n_fallback += 1
+    print(f"[camera] {args.frames - _n_fallback}/{args.frames} poses passed all "
+          f"placement checks; {_n_fallback} fell back to an unchecked sample "
+          f"(high fallback count -> no-go volumes are over-rejecting)")
 
 
 # Camera + render product live at stage scope (not inside a new layer) so the
