@@ -5,6 +5,8 @@ ward_v1_styled_flat/
 ward_v1_mixed_flat/
 ward_v2/
 ward_v2_styled/
+ward_v3*/
+ward_v1_cnet*/
 Collected_Ward0505/
 data/
 *.zip
@@ -27,3 +29,6 @@ __pycache__/
 *.pyo
 .venv/
 .ipynb_checkpoints/
+
+# Cosmos job configs + seg maps (regenerable, reference local paths)
+cosmos_jobs/
