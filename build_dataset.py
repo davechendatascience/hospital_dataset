@@ -99,6 +99,14 @@ def parse_args() -> argparse.Namespace:
                         "each object's ORIGINAL material in place (diffuse-"
                         "texture tint, colour jitter, roughness re-rolls). "
                         "No texture bank needed.")
+    p.add_argument("--randomize-placement", action="store_true",
+                   help="Forward to replicator_dataset.py: per-frame MEANINGFUL "
+                        "placement DR -- free-standing furniture moves as rigid "
+                        "clusters to collision-free floor spots (same room), wall "
+                        "objects slide on their wall, fixtures stay. Labels follow "
+                        "automatically (rendered from the moved scene).")
+    p.add_argument("--placement-shift", type=float, default=0.8,
+                   help="Max XY cluster translation (m) for --randomize-placement.")
     p.add_argument("--train-seed", type=int, default=42)
     p.add_argument("--val-seed",   type=int, default=43)
     p.add_argument("--skip-render", action="store_true",
@@ -200,6 +208,8 @@ def run_replicator(args: argparse.Namespace, split: str, n_frames: int,
     ]
     if getattr(args, "randomize_materials", False):
         cmd += ["--randomize-materials"]
+    if getattr(args, "randomize_placement", False):
+        cmd += ["--randomize-placement", "--placement-shift", str(args.placement_shift)]
     print(f"[render] {split}: invoking replicator with {n_frames} frames "
           f"(seed={seed}) -> {render_root}")
     print("        $", " ".join(cmd))

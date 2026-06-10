@@ -83,6 +83,17 @@ def parse_args():
                         "and roughness re-rolls. Objects keep their identity; "
                         "geometry is untouched, so masks/boxes stay valid. "
                         "Off by default.")
+    p.add_argument("--randomize-placement", action="store_true", default=False,
+                   help="Per-frame meaningful placement DR: free-standing furniture "
+                        "(bed + overbed table + IV pole + chair + bins) moves as "
+                        "rigid proximity CLUSTERS to new collision-free spots on the "
+                        "floor (orientation preserved), surface items ride their "
+                        "cluster, wall-mounted objects slide along their wall, "
+                        "fixtures stay. Objects stay in their own room. See placement_dr.py.")
+    p.add_argument("--placement-shift", type=float, default=0.8,
+                   help="Max XY translation (m) per cluster for --randomize-placement.")
+    p.add_argument("--placement-seed", type=int, default=0,
+                   help="Seed for placement DR (default: --seed).")
     p.add_argument("--extra-channels", action="store_true", default=False,
                    help="Also export ground-truth DEPTH (distance_to_camera + "
                         "distance_to_image_plane), surface NORMALS, and stable "
@@ -1193,8 +1204,33 @@ if MATERIAL_DR:
         print("[material-dr] no perturbable shaders found -> disabling material DR")
         MATERIAL_DR = False
 
+# ---- Meaningful placement DR: precompute per-object per-frame world translate ----
+PLACEMENT_SEQ = {}
+if args.randomize_placement:
+    import placement_dr
+    _pseed = args.placement_seed or args.seed
+    for _ot in object_targets:
+        _prim = stage.GetPrimAtPath(_ot["path"])
+        _M = UsdGeom.Xformable(_prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        _t = _M.ExtractTranslation()
+        _ot["translate"] = (float(_t[0]), float(_t[1]), float(_t[2]))
+        _ot["room"] = assign_room(_ot["path"].rsplit("/", 1)[-1])
+    PLACEMENT_SEQ = placement_dr.generate(
+        object_targets, rooms, floor_z, n_frames=args.frames,
+        seed=_pseed, max_shift=args.placement_shift)
+    _nmoved = sum(1 for v in PLACEMENT_SEQ.values() if len(set(v)) > 1)
+    print(f"[placement-dr] {len(PLACEMENT_SEQ)} objects over {args.frames} frames, "
+          f"max_shift={args.placement_shift} m, seed={_pseed} ({_nmoved} objects move)",
+          flush=True)
+
 # Per-frame randomization: camera pose + ceiling-light intensity/color temp
 with rep.trigger.on_frame(num_frames=args.frames, rt_subframes=args.rt_subframes):
+    if PLACEMENT_SEQ:
+        # author each object's per-frame WORLD translate (orientation untouched)
+        for _ppath, _seq in PLACEMENT_SEQ.items():
+            with rep.get.prims(path_pattern="^" + re.escape(_ppath) + "$",
+                               ignore_case=False):
+                rep.modify.pose(position=rep.distribution.sequence(_seq))
     if MATERIAL_DR:
         # Jitter each object's ORIGINAL material in place every frame. Each
         # matched prim draws its own independent sample (same per-prim
