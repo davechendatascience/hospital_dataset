@@ -133,17 +133,16 @@ def main():
     with open(args.out / "manifest.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["stem", "room", "config"]); w.writeheader(); w.writerows(manifest)
 
-    # loop runner: runs Cosmos-Transfer2.5 per config (one image at a time)
+    # BATCH runner: pass ALL configs to one inference.py call so the 7B model is
+    # loaded ONCE and every image runs sequentially (each with its own prompt).
+    # (-i accepts multiple param files -> batch inference, per inference.py --help.)
     run = args.out / "run_all.sh"
     run.write_text(
         "#!/usr/bin/env bash\n"
-        "# Run Cosmos-Transfer2.5 per-image (one config at a time).\n"
+        "# Cosmos-Transfer2.5 batch: model loaded once, every image (own prompt) in turn.\n"
         f"set -e\ncd {COSMOS_REPO}\n"
-        f'for cfg in {cfg_dir.resolve()}/*.json; do\n'
-        f'  name=$(basename "$cfg" .json)\n'
-        f'  echo "[cosmos] $name"\n'
-        f'  ./.venv/bin/python examples/inference.py -i "$cfg" -o "{out_root}/$name"\n'
-        "done\n")
+        f'./.venv/bin/python examples/inference.py -i {cfg_dir.resolve()}/*.json '
+        f'-o {out_root}\n')
     run.chmod(0o755)
 
     print(f"[cosmos-jobs] {len(sim_files)} images -> {cfg_dir}")
