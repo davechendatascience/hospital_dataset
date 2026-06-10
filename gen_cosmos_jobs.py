@@ -177,8 +177,9 @@ def main():
         print("[cosmos-jobs] style-ref pools: " +
               ", ".join(f"{k}={len(ref_pools[k])}" for k in ("ward", "corridor", "bathroom")))
 
-    cfg_dir = args.out / "configs"; seg_dir = args.out / "seg"
+    cfg_dir = args.out / "configs"; seg_dir = args.out / "seg"; depth_out = args.out / "depth"
     cfg_dir.mkdir(parents=True, exist_ok=True); seg_dir.mkdir(parents=True, exist_ok=True)
+    depth_out.mkdir(parents=True, exist_ok=True)
     out_root = (args.out / "outputs").resolve()
     manifest, counts, n_cap, n_seg, n_depth = [], [0, 0, 0], 0, 0, 0
     for p in sim_files:
@@ -210,7 +211,10 @@ def main():
             n_seg += 1
         dpath = depth_dir / f"{stem}.png"           # DEPTH control
         if args.depth_weight > 0 and dpath.is_file():
-            controls["depth"] = {"control_path": str(dpath.resolve()),
+            # GT depth is grayscale (mode L); Cosmos's control reader needs HWC/3-channel
+            d3 = (depth_out / f"{stem}.png").resolve()
+            Image.open(dpath).convert("RGB").save(d3)
+            controls["depth"] = {"control_path": str(d3),
                                  "control_weight": args.depth_weight}
             n_depth += 1
         cfg = {
