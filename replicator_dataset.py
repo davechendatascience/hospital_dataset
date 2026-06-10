@@ -83,6 +83,18 @@ def parse_args():
                         "and roughness re-rolls. Objects keep their identity; "
                         "geometry is untouched, so masks/boxes stay valid. "
                         "Off by default.")
+    p.add_argument("--extra-channels", action="store_true", default=False,
+                   help="Also export ground-truth DEPTH (distance_to_camera + "
+                        "distance_to_image_plane), surface NORMALS, and stable "
+                        "INSTANCE-ID segmentation alongside RGB. Pixel-aligned "
+                        "control channels for style transfer (depth-conditioned "
+                        "CUT / ControlNet). Off by default; RGB/labels unchanged.")
+    p.add_argument("--cosmos", action="store_true", default=False,
+                   help="Use CosmosWriter instead of BasicWriter: export clip-based "
+                        "multimodal control data (rgb/depth/segmentation/edges/"
+                        "shaded_seg + mp4s) for NVIDIA Cosmos-Transfer sim2real, with "
+                        "use_instance_id=True for cross-frame object identity. Skips "
+                        "the COCO post-step (Cosmos output is clip-structured).")
     return p.parse_args()
 
 
@@ -1205,23 +1217,55 @@ with rep.trigger.on_frame(num_frames=args.frames, rt_subframes=args.rt_subframes
 # Absolute path: Replicator's disk backend redirects RELATIVE output_dir to a
 # default root (~/omni.replicator_out), which then doesn't match where the
 # post-process step looks -> "0 RGB files". Resolve so frames land under --out.
-raw_out = (Path(args.out) / "_raw").resolve()
-raw_out.mkdir(parents=True, exist_ok=True)
-writer = rep.WriterRegistry.get("BasicWriter")
-writer.initialize(
-    output_dir=str(raw_out),
-    rgb=True,
-    bounding_box_2d_tight=True,
-    instance_segmentation=True,
-    semantic_segmentation=True,
-    # semantic_segmentation PNG is colorized so you can VISUALLY confirm masks.
-    # instance_segmentation PNG stays in raw uint32 IDs so the COCO converter
-    # can derive per-instance binary masks reliably (each pixel = instance id).
-    colorize_semantic_segmentation=True,
-    colorize_instance_segmentation=False,
-)
-writer.attach([rp])
-print(f"[render] generating {args.frames} frames into {raw_out}")
+if args.cosmos:
+    # ---- CosmosWriter: clip-based multimodal control data for Cosmos-Transfer.
+    # Outputs rgb/depth/segmentation/shaded_seg/edges (+ mp4s) under a clip layout.
+    # use_instance_id=True embeds per-object identity in the segmentation stream so
+    # identity is preserved across frames (see docs/cosmos3_isaacsim_replicator_*).
+    cosmos_out = (Path(args.out) / "_cosmos").resolve()
+    cosmos_out.mkdir(parents=True, exist_ok=True)
+    backend = rep.backends.get("DiskBackend")
+    backend.initialize(output_dir=str(cosmos_out))
+    writer = rep.WriterRegistry.get("CosmosWriter")
+    writer.initialize(backend=backend, use_instance_id=True)
+    writer.attach(rp)
+    print(f"[render][cosmos] CosmosWriter (use_instance_id=True) -> {cosmos_out}",
+          flush=True)
+    print(f"[render] generating {args.frames} frames into {cosmos_out}")
+else:
+    # Writer: BasicWriter outputs RGB + COCO-ish data; folded into your
+    # rgbDataset/jsonDataset layout in step 6 below.
+    # Absolute path: Replicator's disk backend redirects RELATIVE output_dir to a
+    # default root (~/omni.replicator_out), which then doesn't match where the
+    # post-process step looks -> "0 RGB files". Resolve so frames land under --out.
+    raw_out = (Path(args.out) / "_raw").resolve()
+    raw_out.mkdir(parents=True, exist_ok=True)
+    writer = rep.WriterRegistry.get("BasicWriter")
+    _writer_kwargs = dict(
+        output_dir=str(raw_out),
+        rgb=True,
+        bounding_box_2d_tight=True,
+        instance_segmentation=True,
+        semantic_segmentation=True,
+        # semantic_segmentation PNG is colorized so you can VISUALLY confirm masks.
+        # instance_segmentation PNG stays in raw uint32 IDs so the COCO converter
+        # can derive per-instance binary masks reliably (each pixel = instance id).
+        colorize_semantic_segmentation=True,
+        colorize_instance_segmentation=False,
+    )
+    if args.extra_channels:
+        # Ground-truth, pixel-aligned control channels (Isaac, not estimated).
+        _writer_kwargs.update(
+            distance_to_camera=True,        # radial depth (m) -> *.npy per frame
+            distance_to_image_plane=True,   # planar depth (m)
+            normals=True,                   # surface normals (RGB-encoded)
+            instance_id_segmentation=True,  # stable per-object IDs
+        )
+        print("[render] --extra-channels: also writing depth + normals + instance_id",
+              flush=True)
+    writer.initialize(**_writer_kwargs)
+    writer.attach([rp])
+    print(f"[render] generating {args.frames} frames into {raw_out}")
 
 # rep.orchestrator.run() is async; we need to actually pump frames in
 # standalone mode. Prefer run_until_complete() when available; fall back to
@@ -1249,11 +1293,22 @@ def _run_orchestrator_sync():
             break
 
 _run_orchestrator_sync()
-print(f"[render] orchestrator done; rendered files now under {raw_out}")
-# A quick directory sanity-check so we can see if anything was actually written
-_written = list(raw_out.rglob("rgb_*.png"))
-print(f"[render] wrote {len(_written)} RGB files; "
-      f"example: {_written[0] if _written else '(none!)'}")
+if args.cosmos:
+    rep.orchestrator.wait_until_complete()
+    try:
+        writer.detach()
+    except Exception:
+        pass
+    cosmos_out = (Path(args.out) / "_cosmos").resolve()
+    _clips = sorted(cosmos_out.glob("*"))
+    print(f"[render][cosmos] done -> {cosmos_out}  ({len(_clips)} entries); "
+          f"modality subfolders + mp4s for Cosmos-Transfer")
+else:
+    print(f"[render] orchestrator done; rendered files now under {raw_out}")
+    # A quick directory sanity-check so we can see if anything was actually written
+    _written = list(raw_out.rglob("rgb_*.png"))
+    print(f"[render] wrote {len(_written)} RGB files; "
+          f"example: {_written[0] if _written else '(none!)'}")
 
 
 # ============================================================================
@@ -1371,15 +1426,19 @@ def basic_writer_to_coco(raw_dir: Path, out_root: Path, tag: str,
     return coco
 
 
-print("[post] converting BasicWriter output -> rgbDataset/jsonDataset layout")
-basic_writer_to_coco(
-    raw_dir=Path(args.out) / "_raw",
-    out_root=Path(args.out),
-    tag=args.tag,
-    category_map=FIXED_CATEGORIES,
-)
-print(f"[done] dataset under {args.out}")
-print(f"      then run:  python -m src.from_ward_to_roboflow_dataset \\")
-print(f"                    --input-root {args.out}")
+if args.cosmos:
+    print(f"[done][cosmos] clip data under {Path(args.out) / '_cosmos'}")
+    print(f"      feed the modality folders/mp4s to Cosmos-Transfer for sim2real.")
+else:
+    print("[post] converting BasicWriter output -> rgbDataset/jsonDataset layout")
+    basic_writer_to_coco(
+        raw_dir=Path(args.out) / "_raw",
+        out_root=Path(args.out),
+        tag=args.tag,
+        category_map=FIXED_CATEGORIES,
+    )
+    print(f"[done] dataset under {args.out}")
+    print(f"      then run:  python -m src.from_ward_to_roboflow_dataset \\")
+    print(f"                    --input-root {args.out}")
 
 sim_app.close()
