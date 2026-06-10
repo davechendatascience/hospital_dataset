@@ -84,6 +84,9 @@ def main():
     ap.add_argument("--sim-dir", type=Path, default=PROJECT / "ward_v3/train/images")
     ap.add_argument("--out", type=Path, default=PROJECT / "cosmos_jobs")
     ap.add_argument("--control", default="edge", choices=["edge", "depth", "seg"])
+    ap.add_argument("--captions", type=Path, default=None,
+                    help="JSON {stem: prompt} from caption_images.py -> per-image prompt "
+                         "(falls back to the room template prompt if a stem is missing).")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--device", default="0")
@@ -109,17 +112,25 @@ def main():
     simn = sim_emb / (np.linalg.norm(sim_emb, axis=1, keepdims=True) + 1e-9)
     assign = (simn @ refn.T).argmax(1)          # index into ROOMS per sim image
 
+    caps = {}
+    if args.captions and Path(args.captions).is_file():
+        caps = json.loads(Path(args.captions).read_text())
+        print(f"[cosmos-jobs] loaded {len(caps)} per-image captions from {args.captions}")
+
     cfg_dir = args.out / "configs"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     out_root = (args.out / "outputs").resolve()
-    manifest, counts = [], [0, 0, 0]
+    manifest, counts, n_cap = [], [0, 0, 0], 0
     for p, ri in zip(sim_files, assign):
         room = ROOMS[int(ri)]
         counts[int(ri)] += 1
         stem = Path(p).stem
+        prompt = caps.get(stem, room["prompt"])     # per-image caption, else room template
+        if stem in caps:
+            n_cap += 1
         cfg = {
             "name": f"{room['name']}_{stem}",
-            "prompt": room["prompt"],
+            "prompt": prompt,
             "video_path": str(Path(p).resolve()),     # single image
             "max_frames": 1,
             "num_video_frames_per_chunk": 1,
@@ -145,8 +156,9 @@ def main():
         f'-o {out_root}\n')
     run.chmod(0o755)
 
-    print(f"[cosmos-jobs] {len(sim_files)} images -> {cfg_dir}")
-    print(f"[cosmos-jobs] room assignment: " +
+    print(f"[cosmos-jobs] {len(sim_files)} images -> {cfg_dir}  "
+          f"(prompts: {n_cap} per-image caption, {len(sim_files)-n_cap} room-template)")
+    print(f"[cosmos-jobs] room assignment (image_context_path style ref): " +
           ", ".join(f"{ROOMS[i]['name']}={counts[i]}" for i in range(3)))
     print(f"[cosmos-jobs] outputs -> {out_root}")
     print(f"[cosmos-jobs] run all:  bash {run}")
