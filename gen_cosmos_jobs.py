@@ -119,6 +119,12 @@ def main():
                          "Set 0 to disable depth control.")
     ap.add_argument("--depth-dir", type=Path, default=None,
                     help="dir of depth PNGs (default <sim-dir>/../depth).")
+    ap.add_argument("--guided", dest="guided", action="store_true", default=True,
+                    help="guided generation: anchor the labeled foreground (union of object "
+                         "masks) during denoising so object structure/identity is preserved.")
+    ap.add_argument("--no-guided", dest="guided", action="store_false")
+    ap.add_argument("--guided-steps", type=int, default=25,
+                    help="guided_generation_step_threshold (higher = stronger foreground anchor).")
     ap.add_argument("--vary-style", action="store_true", default=False,
                     help="style variance (deterministic by stem): per-image random real "
                          "style-ref from the scene pool + random seed + a lighting modifier.")
@@ -187,10 +193,11 @@ def main():
               ", ".join(f"{k}={len(ref_pools[k])}" for k in ("ward", "corridor", "bathroom")))
 
     cfg_dir = args.out / "configs"; seg_dir = args.out / "seg"; depth_out = args.out / "depth"
-    cfg_dir.mkdir(parents=True, exist_ok=True); seg_dir.mkdir(parents=True, exist_ok=True)
-    depth_out.mkdir(parents=True, exist_ok=True)
+    fg_dir = args.out / "fgmask"
+    for d in (cfg_dir, seg_dir, depth_out, fg_dir):
+        d.mkdir(parents=True, exist_ok=True)
     out_root = (args.out / "outputs").resolve()
-    manifest, counts, n_cap, n_seg, n_depth = [], [0, 0, 0], 0, 0, 0
+    manifest, counts, n_cap, n_seg, n_depth, n_guided = [], [0, 0, 0], 0, 0, 0, 0
     for p in sim_files:
         stem = Path(p).stem
         img_id = stem2id.get(stem)
@@ -210,16 +217,27 @@ def main():
             seed = rng.randrange(1, 1_000_000)
             prompt = f"{prompt} {rng.choice(STYLE_MODIFIERS)}."
         controls = {}
-        if img_id is not None:                      # SEG (label) control map
+        guided = {}
+        if img_id is not None:                      # SEG (label) control map + FG mask
             info = coco.imgs[img_id]; H, W = info["height"], info["width"]
             seg = np.zeros((H, W, 3), np.uint8)
+            fg = np.zeros((H, W), np.uint8)         # foreground = union of object masks
             for a in coco.imgToAnns.get(img_id, []):
                 if a["category_id"] != 0:
-                    seg[coco.annToMask(a) > 0] = pal[a["category_id"] % 64]
+                    m = coco.annToMask(a)
+                    seg[m > 0] = pal[a["category_id"] % 64]
+                    fg[m > 0] = 255
             segp = (seg_dir / f"{stem}.png").resolve()
             Image.fromarray(seg).save(segp)
             controls["seg"] = {"control_path": str(segp), "control_weight": args.seg_weight}
             n_seg += 1
+            if args.guided:                          # anchor labeled foreground during denoise
+                # guided mask must be .npz with 'arr_0' shape (T,H,W); non-zero = foreground
+                fgp = (fg_dir / f"{stem}.npz").resolve()
+                np.savez(str(fgp), fg[None].astype(np.uint8))   # (1,H,W)
+                guided = {"guided_generation_mask": str(fgp),
+                          "guided_generation_step_threshold": args.guided_steps}
+                n_guided += 1
         dpath = depth_dir / f"{stem}.png"           # DEPTH control
         if args.depth_weight > 0 and dpath.is_file():
             # GT depth is grayscale (mode L); Cosmos's control reader needs HWC/3-channel
@@ -236,6 +254,7 @@ def main():
             "image_context_path": ref,
             "seed": seed,
             **controls,
+            **guided,
         }
         (cfg_dir / f"{stem}.json").write_text(json.dumps(cfg, indent=2))
         manifest.append({"stem": stem, "room": room["name"], "config": str(cfg_dir / f"{stem}.json")})
@@ -243,7 +262,8 @@ def main():
     with open(args.out / "manifest.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["stem", "room", "config"]); w.writeheader(); w.writerows(manifest)
     print(f"[cosmos-jobs] controls: seg={n_seg} (w={args.seg_weight}), "
-          f"depth={n_depth} (w={args.depth_weight})")
+          f"depth={n_depth} (w={args.depth_weight}), "
+          f"guided-fg-mask={n_guided} (steps={args.guided_steps})")
 
     # BATCH runner: pass ALL configs to one inference.py call so the 7B model is
     # loaded ONCE and every image runs sequentially (each with its own prompt).
