@@ -1,138 +1,133 @@
-# Cosmos‑Transfer2.5 for Ward Sim‑to‑Real — Approach & Breakthroughs
+# Cosmos‑Transfer2.5 病房 Sim‑to‑Real — 方法與突破
 
-Working notes on how we use **NVIDIA Cosmos‑Transfer2.5‑2B** to turn synthetic Isaac‑Sim
-ward renders into photorealistic, *our‑ward*-matching images while keeping the synthetic
-labels valid — and the sequence of fixes/insights that got it working.
+這份筆記記錄我們如何使用 **NVIDIA Cosmos‑Transfer2.5‑2B**，把 Isaac‑Sim 合成的病房算圖
+轉換成擬真、且符合「我們這間病房」風格的影像，同時保留合成資料的標註（labels）有效；
+也記錄了讓它真正能用的一連串修正與洞見。
 
-Implementation: `gen_cosmos_jobs.py` (builds one Cosmos job per sim frame) →
-`cosmos_jobs/run_all.sh` (resumable batch). Cosmos repo + env: `~/cosmos-transfer2.5`.
+實作：`gen_cosmos_jobs.py`（為每一張 sim 影格產生一個 Cosmos job）→
+`cosmos_jobs/run_all.sh`（可續跑的批次）。Cosmos 程式庫與環境位於 `~/cosmos-transfer2.5`。
 
 ---
 
-## 1. Why Cosmos (after GAN and ControlNet failed)
+## 1. 為什麼選 Cosmos（在 GAN 與 ControlNet 失敗之後）
 
-| approach | outcome | why |
+| 方法 | 結果 | 原因 |
 |---|---|---|
-| CUT / CycleGAN (+depth, +CLIP‑MMD loss) | ✗ gap never closed | a small generator + ~728‑image discriminator has no real‑image prior |
-| ControlNet‑SD (depth/seg + LoRA‑on‑real + IP‑Adapter) | ~ only ~28 % of the DINOv2‑MMD gap closed | photoreal, but a *generic* SD look — not our specific ward |
-| **Cosmos‑Transfer2.5‑2B** | ✓ photoreal **and** our‑ward | a world‑foundation prior + multimodal spatial control + a real style reference |
+| CUT / CycleGAN（含 depth、+CLIP‑MMD loss） | ✗ 差距始終無法收斂 | 小型 generator + 約 728 張影像的 discriminator，缺乏真實影像先驗 |
+| ControlNet‑SD（depth/seg control + LoRA‑on‑real + IP‑Adapter） | ~ 只縮小約 28% 的 DINOv2‑MMD 差距 | 擬真，但是「通用 SD」的樣貌 —— 不是我們這間病房 |
+| **Cosmos‑Transfer2.5‑2B** | ✓ 既擬真又像我們的病房 | world‑foundation 先驗 + 多模態空間控制 + 真實風格參考影像 |
 
-Cosmos was the first method to produce output that both looks real and matches our ward,
-because structure is pinned by control maps while appearance comes from a real reference image
-and a billion‑scale generative prior — see `sim2real-translation-findings.md` for the negatives.
+Cosmos 是第一個同時做到「看起來真實」且「符合我們病房」的方法，因為結構由 control maps
+釘住，而外觀來自一張真實參考影像加上十億級的生成式先驗 —— 反面結果見
+`sim2real-translation-findings.md`。
 
-## 2. How Cosmos‑Transfer2.5 works (the levers we use)
+## 2. Cosmos‑Transfer2.5 的運作方式（我們用到的控制桿）
 
-Run mode: **image‑to‑image**, one frame per job (`max_frames: 1`,
-`num_video_frames_per_chunk: 1`), via `examples/inference.py -i <cfg>.json -o <out>`.
+執行模式：**image‑to‑image**，每個 job 一張影格（`max_frames: 1`、
+`num_video_frames_per_chunk: 1`），透過 `examples/inference.py -i <cfg>.json -o <out>` 執行。
 
-- **`video_path`** — the sim RGB frame (the thing being restyled).
-- **Control branches** (each `{control_path?, control_weight}`; spatial, ControlNet‑style):
-  - `seg` — class‑id colour map rasterized from the sim COCO → object **regions**.
-  - `depth` — ground‑truth Isaac depth → **geometry**.
-  - `edge` — contours (computed on the fly) → shape without colour.
-  - `vis` (blur) — keeps the **input's colour/texture**; we deliberately **omit** it (it drags sim colours in).
-- **`image_context_path`** — a **real ward photo** as the style reference (the IP‑Adapter‑like
-  appearance driver: colour, materials, lighting).
-- **`prompt`** — text describing the scene/objects. Encoded by **Cosmos‑Reason1‑7B** (used as the
-  *text encoder*, not an automatic prompt‑rewriter — there is no scene‑reasoning upsampler in this path).
-- **`guidance`** — classifier‑free guidance (default 3; modest so structure isn't overpowered).
-- **Guided generation** (optional, important — see §4): `guided_generation_mask` (a foreground mask)
-  anchors masked regions to the sim during early denoising; `guided_generation_step_threshold`
-  controls how long.
+- **`video_path`** —— sim 的 RGB 影格（被重新上樣式的對象）。
+- **Control 分支**（每個為 `{control_path?, control_weight}`；空間性的、ControlNet 風格）：
+  - `seg` —— 由 sim COCO 點陣化出的 class‑id 顏色圖 → 物件**區域**。
+  - `depth` —— Isaac 的 ground‑truth 深度 → **幾何**。
+  - `edge` —— 輪廓（即時計算）→ 只給形狀、不給顏色。
+  - `vis`（blur）—— 保留**輸入影像的顏色/紋理**；我們刻意**不使用**它（會把 sim 的顏色帶進來）。
+- **`image_context_path`** —— 一張**真實病房照片**當作風格參考（類似 IP‑Adapter 的外觀驅動：
+  顏色、材質、光線）。
+- **`prompt`** —— 描述場景/物件的文字。由 **Cosmos‑Reason1‑7B** 編碼（它在這條推論路徑中
+  是當作*文字編碼器*，並不是會自動改寫 prompt 的場景推理器 —— 此路徑沒有 prompt 上採樣/重寫機制）。
+- **`guidance`** —— classifier‑free guidance（預設 3；維持適中，避免文字蓋過結構）。
+- **Guided generation**（選用、且很重要 —— 見 §4）：`guided_generation_mask`（前景遮罩）
+  在去噪早期把遮罩區域錨定到 sim；`guided_generation_step_threshold` 控制錨定持續多久。
 
-**Critical limitation:** Cosmos has **no per‑region class→appearance binding**. The seg map is
-purely *spatial* (no colour→“overbed table” legend), and the prompt is *scene‑level*. So object
-**identity** is *biased* (prompt) and *anchored in structure* (guided mask), but never hard‑bound to
-a region. True per‑class control would require **post‑training/LoRA on the seg control branch**.
+**關鍵限制：** Cosmos **沒有逐區域的 class→外觀綁定**。seg 圖純粹是*空間性*的（沒有
+顏色→「overbed table」的對照表），而 prompt 是*場景層級*的。因此物件**身分（identity）**只能
+被*引導*（透過 prompt）與在*結構上被錨定*（透過 guided mask），永遠不會被硬性綁定到某個區域。
+要做到真正的逐類別控制，需要**對 seg control 分支做 post‑training / LoRA**。
 
-## 3. Breakthroughs & fixes (chronological)
+## 3. 突破與修正（依時間順序）
 
-### 3.1 Depth control must be 3‑channel
-Cosmos's control reader does `einops.rearrange(x, "t h w c -> t c h w")`, i.e. it needs **HWC**.
-Our GT depth PNGs are grayscale (`mode L`, 2‑D) → it crashed the whole batch
-(`Wrong shape: expected 4 dims … (1,1080,1920)`). **Fix:** write the depth control as a
-3‑channel RGB copy (`Image.open(d).convert("RGB")`). The seg map was already RGB, so only depth needed it.
+### 3.1 Depth control 必須是 3 通道
+Cosmos 的 control reader 會執行 `einops.rearrange(x, "t h w c -> t c h w")`，也就是需要 **HWC**。
+我們的 GT depth PNG 是灰階（`mode L`，2 維）→ 直接讓整個批次崩潰
+（`Wrong shape: expected 4 dims … (1,1080,1920)`）。**修正：** 把 depth control 另存成 3 通道
+RGB（`Image.open(d).convert("RGB")`）。seg 圖原本就是 RGB，所以只有 depth 需要處理。
 
-### 3.2 Label‑driven prompts (correct object *types*)
-A generic scene template made Cosmos render a *cabinet* where the labels said **overbed table**
-(the prompt literally said "bedside cabinet"). **Fix:** build each frame's prompt from its **own
-COCO classes** (`overbed table, IV pole, telephone, …`). Naming the real objects biases Cosmos to
-render the right ones.
+### 3.2 以標註驅動的 prompt（正確的物件*類型*）
+通用場景模板會讓 Cosmos 在標註寫著 **overbed table** 的地方畫出*櫃子* (cabinet)
+（因為 prompt 字面就寫了 "bedside cabinet"）。**修正：** 每張影格的 prompt 改成由它**自己的
+COCO 類別**組成（`overbed table, IV pole, telephone, …`）。點名真實存在的物件，會引導 Cosmos
+畫出正確的物件。
 
-### 3.3 Guided generation = anchoring the labeled foreground
-To stop the model reinterpreting objects, feed a **foreground mask** (union of the frame's instance
-masks) as `guided_generation_mask`. Details that bit us:
-- Format is **`.npz` with key `arr_0`, shape `(T,H,W)`** (single‑channel; `foreground_labels=None`
-  ⇒ any non‑zero = foreground). A PNG is rejected ("not a mp4 or npz file").
-- **`guided_generation_step_threshold` is an integer step count** (default 10, out of ~35 denoise
-  steps) — *not* a 0–1 fraction. (External advice quoting "0.3" maps to ~10 steps here.)
+### 3.3 Guided generation = 錨定有標註的前景
+為了阻止模型自行重新詮釋物件，我們把**前景遮罩**（該影格所有 instance mask 的聯集）餵給
+`guided_generation_mask`。踩過的坑：
+- 格式必須是 **`.npz`、key 為 `arr_0`、shape 為 `(T,H,W)`**（單通道；`foreground_labels=None`
+  代表任何非零值都算前景）。PNG 會被拒絕（"not a mp4 or npz file"）。
+- **`guided_generation_step_threshold` 是整數的步數**（預設 10，總去噪步數約 35）——
+  *不是* 0–1 的比例。（外部建議講的「0.3」在這裡約等於 10 步。）
 
-### 3.4 The guided‑vs‑realism tension
-Guided generation anchors masked regions **to the sim input**, so it preserves structure/identity
-but pulls the **foreground appearance toward sim** (overriding the real style ref there). Measured on
-one ward frame:
-- **steps 25 (strong):** identity locked, but sim‑ish (green table top, navy bed).
-- **steps 12 (moderate):** good balance — clearly a table, mostly realistic.
-- **steps 0 (off):** most photoreal, but object identity can drift.
+### 3.4 Guided 與擬真之間的拉扯
+Guided generation 會把遮罩區域錨定**到 sim 輸入**，所以它保留了結構/身分，卻把**前景外觀
+往 sim 拉**（在那些區域蓋過真實風格參考）。在一張病房影格上量測：
+- **steps 25（強）：** 身分鎖得很死，但偏 sim 味（桌面偏綠、床偏深藍）。
+- **steps 12（中）：** 平衡良好 —— 明顯是一張桌子，且大致擬真。
+- **steps 0（關）：** 最擬真，但物件身分可能漂移。
 
-So strength is a dial between *identity* (high) and *realism* (low).
+所以強度是一個在*身分*（高）與*擬真*（低）之間的旋鈕。
 
-### 3.5 Why we still need guided masks (context can mislead)
-Without guidance, the **`image_context_path` (style ref) can dominate** and make Cosmos
-*generate from the reference's content* rather than the sim's actual scene → wrong objects/scene.
-The guided foreground mask anchors *this* frame's structure so the reference only **restyles**.
-Conclusion: keep guided **on**, but **moderate** (steps ≈ 10) — anchor structure early, release for
-realistic restyle late.
+### 3.5 為什麼我們仍然需要 guided mask（context 會誤導）
+沒有 guidance 時，**`image_context_path`（風格參考）可能會主導**，讓 Cosmos
+*從參考影像的內容去生成*，而不是依 sim 的實際場景 → 物件/場景錯誤。guided 前景遮罩會錨定
+*這一張*影格的結構，使參考影像只負責**重新上樣式**。結論：guided 保持**開啟**，但用**中等強度**
+（steps ≈ 10）—— 早期錨定結構、後期釋放以做擬真的重新上樣式。
 
-### 3.6 Drop our scene classifier — the controls already define the scene
-We had a heuristic ward/corridor/bathroom classifier (by object presence) that **mislabeled**
-frames (e.g. a sink in a corridor → "bathroom"; a medical‑gas headwall → "corridor"), which then
-attached the wrong prompt **and** the wrong style ref. Since Cosmos has no auto‑reasoner *and* the
-**seg+depth controls + guided mask already encode the real scene structure**, we removed the
-classifier entirely:
-- **Prompt** is now scene‑agnostic — "a realistic Taiwanese hospital interior, with `<the frame's
-  actual objects>`; `<shared materials>`." The controls dictate the scene.
-- **Validated:** frame `0006` now renders a correct **medical‑gas headwall** (was wrongly "corridor")
-  and `0008` a correct **utility/corridor with bins** (was wrongly "bathroom").
+### 3.6 拿掉我們自己的場景分類器 —— control 已經定義了場景
+我們原本有一個（依物件存在與否的）ward/corridor/bathroom 啟發式分類器，它會**標錯**影格
+（例如走廊裡有洗手台 → 被判成 "bathroom"；醫療氣體床頭板 → 被判成 "corridor"），接著就掛上
+錯誤的 prompt **與**錯誤的風格參考。由於 Cosmos 沒有自動推理器，*而且* **seg+depth control +
+guided mask 本來就已經編碼了真實的場景結構**，我們把分類器整個移除：
+- **Prompt** 改為與場景無關 —— 「一張寫實的台灣醫院室內照，包含 `<這張影格實際的物件>`；
+  `<共用材質>`。」場景由 control 決定。
+- **已驗證：** 影格 `0006` 現在正確算成**醫療氣體床頭板**（先前被誤判為 "corridor"），
+  `0008` 正確算成**有垃圾桶的雜物/走廊區**（先前被誤判為 "bathroom"）。
 
-### 3.7 Content‑matched style reference (object‑inventory Jaccard)
-How to pick the real `image_context_path` per frame, robustly:
-- **Not** DINOv2 nearest‑neighbour — sim ≠ real in DINOv2 space, so it misassigns.
-- **Not** a scene label — brittle (see 3.6).
-- **Yes:** index every real test photo by its **set of object classes**, then for each sim frame
-  pick the real photo with the highest **Jaccard** overlap of class sets (top‑K; `--vary-style`
-  samples among the top‑8 for variety). Both sides have COCO labels, so we match on the actual
-  objects present. (Requires the real refs to be labeled — `ward_v3/test`, 728 annotated photos.)
+### 3.7 以內容匹配風格參考（物件清單的 Jaccard）
+如何穩健地為每張影格挑選真實的 `image_context_path`：
+- **不要**用 DINOv2 最近鄰 —— 在 DINOv2 空間裡 sim ≠ real，會配錯。
+- **不要**用場景標籤 —— 太脆弱（見 3.6）。
+- **要：** 把每張真實測試照片以其**物件類別集合**建索引，然後對每張 sim 影格，挑選類別集合
+  **Jaccard** 重疊度最高的真實照片（取 top‑K；`--vary-style` 會在 top‑8 中抽樣以增加多樣性）。
+  兩邊都有 COCO 標註，所以是依「實際存在的物件」來匹配。（前提：真實參考需有標註 ——
+  `ward_v3/test`，728 張已標註照片。）
 
-## 4. The current recipe (`gen_cosmos_jobs.py` defaults)
+## 4. 目前的配方（`gen_cosmos_jobs.py` 預設值）
 
-| lever | value | rationale |
+| 控制桿 | 數值 | 理由 |
 |---|---|---|
-| `seg` control_weight | **0.6** | keep object regions without imprinting the palette colours |
-| `depth` control_weight | **0.8** | strong geometry/viewpoint anchor |
-| `edge` control_weight | **1.0** | contours/shape without colour (on the fly) |
-| `vis` | **off** | vis preserves the *sim's* colour/texture — the opposite of what we want |
-| `guided_generation_step_threshold` | **10** (of ~35) | anchor structure early, release for realistic restyle late |
-| guided mask | union of object masks, `.npz arr_0 (1,H,W)` | anchors labeled foreground; stops context‑misgeneration |
-| `guidance` | **3** | modest, so structure isn't overpowered by text |
-| `prompt` | scene‑agnostic + the frame's **actual COCO objects** | correct object types; no brittle scene class |
-| `image_context_path` | real photo, **object‑inventory matched** (Jaccard) | appropriate appearance per frame |
-| `--vary-style` | sample top‑8 refs + random seed + lighting modifier | style diversity for a training set |
+| `seg` control_weight | **0.6** | 保留物件區域，但不讓調色盤顏色被印上去 |
+| `depth` control_weight | **0.8** | 強力錨定幾何/視角 |
+| `edge` control_weight | **1.0** | 給輪廓/形狀但不給顏色（即時計算） |
+| `vis` | **關閉** | vis 會保留 *sim 的* 顏色/紋理 —— 與我們要的相反 |
+| `guided_generation_step_threshold` | **10**（約 35 步中） | 早期錨定結構，後期釋放以擬真重新上樣式 |
+| guided mask | 物件 mask 聯集，`.npz arr_0 (1,H,W)` | 錨定有標註的前景；阻止 context 誤生成 |
+| `guidance` | **3** | 適中，避免文字蓋過結構 |
+| `prompt` | 與場景無關 + 影格**實際的 COCO 物件** | 正確的物件類型；不靠脆弱的場景分類 |
+| `image_context_path` | 真實照片，依**物件清單匹配**（Jaccard） | 每張影格有合適的外觀 |
+| `--vary-style` | 從 top‑8 參考抽樣 + 隨機 seed + 光線修飾語 | 為訓練集帶來風格多樣性 |
 
-Per‑frame the pipeline writes: `cosmos_jobs/seg/<stem>.png`, `depth/<stem>.png` (RGB),
-`fgmask/<stem>.npz`, and `configs/<stem>.json`. The batch (`run_all.sh`) is **resumable** — it
-skips frames whose output exists and restarts on the remainder if a frame aborts.
+每張影格 pipeline 會寫出：`cosmos_jobs/seg/<stem>.png`、`depth/<stem>.png`（RGB）、
+`fgmask/<stem>.npz`、以及 `configs/<stem>.json`。批次（`run_all.sh`）**可續跑** —— 會跳過
+已有輸出的影格，若某張影格中止則對其餘的重新開始。
 
-## 5. What's validated / what's open
+## 5. 已驗證 / 待辦
 
-**Validated:** end‑to‑end on ward/headwall/corridor/bathroom frames — photoreal, our‑ward style,
-correct scene & object types, labels positionally preserved (seg+depth), and the guided mask prevents
-the style ref from hijacking content.
+**已驗證：** 在病房/床頭板/走廊/浴室影格上端到端跑通 —— 擬真、符合我們病房的風格、場景與
+物件類型正確、標註位置保留（seg+depth），且 guided mask 能阻止風格參考劫持內容。
 
-**Open:**
-- Per‑region class→appearance is still only *biased*, not bound. For hard guarantees → **post‑train /
-  LoRA the seg branch** on our taxonomy (Cosmos provides a vid2vid post‑training config).
-- The full 2700‑frame batch is ~30 h on one GB10 (single GPU, sequential, ~40 s/frame).
-- Final selection metric is **detector AP on the real holdout** (`train_yolo_da.py`), not the
-  DINOv2/CLIP gap (that's only a guide).
+**待辦：**
+- 逐區域的 class→外觀目前仍只是*被引導*、而非被綁定。要硬性保證 → 在我們的分類體系上
+  **對 seg 分支做 post‑train / LoRA**（Cosmos 提供 vid2vid 的 post‑training 設定）。
+- 完整 2700 張影格的批次在單張 GB10 上約需 ~30 小時（單 GPU、循序、約 40 秒/影格）。
+- 最終的取捨指標是**在真實 holdout 上的偵測器 AP**（`train_yolo_da.py`），而不是 DINOv2/CLIP
+  差距（那只是參考）。
