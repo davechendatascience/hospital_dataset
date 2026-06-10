@@ -28,44 +28,38 @@ PROJECT = Path(__file__).resolve().parent
 TEST = PROJECT / "ward_v3" / "test" / "images"
 COSMOS_REPO = Path("/home/edge-host/cosmos-transfer2.5")
 
-# 3 rooms: representative real photo (style ref) + its prompt (from DINOv2
-# clustering of ward_v3/test + manual captioning).
+# 3 scene types in the footage: WARD room, CORRIDOR (utility nook with two bins),
+# BATHROOM. Each: representative real photo (style ref, from ward_v3/test) + a
+# scene-type prompt. Sim images are assigned to the nearest ref by DINOv2.
 ROOMS = [
+    {
+        "name": "ward",
+        "ref": TEST / "WIN_20260331_11_10_31_Pro_frame_00630_png.rf.75d81cbd26be74104e3509f5df918c1f.jpg",
+        "prompt": ("A realistic photograph of a Taiwanese hospital ward patient room: an "
+                   "electric care bed with a deep purple-navy mattress and white plastic side "
+                   "rails, a stainless-steel IV pole, a wall-mounted vital-signs monitor on an "
+                   "articulated arm, a white louvered air-conditioner, a UV germicidal lamp, a "
+                   "beige wall telephone, a white bedside cabinet, a mint-green privacy curtain, "
+                   "cream and beige walls with wood-grain laminate wainscot, light wood laminate "
+                   "floor, a window with sheer curtains, soft natural daylight."),
+    },
+    {
+        "name": "corridor",
+        "ref": TEST / "WIN_20260331_12_10_38_Pro_frame_00625_png.rf.232c56cd353d169117ca36485026ff84.jpg",
+        "prompt": ("A realistic photograph of a Taiwanese hospital corridor and utility nook: a "
+                   "stainless-steel rolling soiled-linen bin holding a fabric laundry bag, and a "
+                   "cream pedal-operated biomedical-waste bin with a red plastic liner and a "
+                   "biohazard label, beside wood-grain laminate wall panels and a sliding door, "
+                   "light wood laminate floor, cream walls, soft indoor lighting."),
+    },
     {
         "name": "bathroom",
         "ref": TEST / "WIN_20260331_11_26_06_Pro_frame_04423_png.rf.ebcab57482d5df6214098c18da6fce1a.jpg",
-        "prompt": ("A realistic photograph of a hospital ward ensuite bathroom. White "
-                   "square ceramic wall tiles, beige floor tiles; a white toilet; "
-                   "stainless-steel L-shaped and flip-up grab bars; a chrome toilet-paper "
-                   "holder; a wall-mounted ceramic sink with chrome faucet and a framed "
-                   "mirror; red nurse-call buttons; an open doorway to the ward with a care "
-                   "bed, mint-green curtain and light wood laminate floor. Soft daylight, "
-                   "slightly wide-angle, high detail."),
-    },
-    {
-        "name": "headwall",
-        "ref": TEST / "WIN_20260331_11_05_48_Pro_frame_04401_png.rf.e8625b1d4e153b4bde6f719191fe8096.jpg",
-        "prompt": ("A realistic close-up photograph of a hospital ward headwall. Cream "
-                   "upper wall with beige wood-grain wainscot; a large white louvered "
-                   "air-conditioner in a wood frame; a wall-mounted vital-signs monitor on "
-                   "an articulated arm; a white UV germicidal lamp; a beige corded wall "
-                   "telephone; a white bedside cabinet; a medical gas panel with a green "
-                   "oxygen flowmeter, a suction regulator with a clear collection jar, a "
-                   "pressure gauge and colored wall outlets; a pale mint-green privacy "
-                   "curtain. Soft daylight, high detail."),
-    },
-    {
-        "name": "fullroom",
-        "ref": TEST / "WIN_20260331_11_10_31_Pro_frame_00630_png.rf.75d81cbd26be74104e3509f5df918c1f.jpg",
-        "prompt": ("A realistic wide photograph of a hospital ward patient room. Cream "
-                   "walls with beige wood-grain wainscot; a suspended grid ceiling; a white "
-                   "louvered air-conditioner in a wood frame; a wall-mounted vitals monitor "
-                   "on an arm; a UV germicidal lamp; a beige wall telephone; a "
-                   "stainless-steel IV pole with hooks; a white bedside cabinet; an electric "
-                   "care bed with a deep purple mattress and white plastic side rails; a "
-                   "mint-green privacy curtain; a window with sheer curtains and bright "
-                   "daylight; a wood door; light wood laminate floor. Slightly wide-angle, "
-                   "high detail."),
+        "prompt": ("A realistic photograph of a Taiwanese hospital ward ensuite bathroom: white "
+                   "square ceramic wall tiles and beige floor tiles, a white toilet, "
+                   "stainless-steel L-shaped and flip-up grab bars, a chrome toilet-paper "
+                   "holder, a wall-mounted ceramic sink with a chrome faucet and a framed "
+                   "mirror, red nurse-call buttons, soft daylight."),
     },
 ]
 
@@ -83,7 +77,14 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sim-dir", type=Path, default=PROJECT / "ward_v3/train/images")
     ap.add_argument("--out", type=Path, default=PROJECT / "cosmos_jobs")
-    ap.add_argument("--control", default="edge", choices=["edge", "depth", "seg"])
+    ap.add_argument("--seg-weight", type=float, default=1.0,
+                    help="seg (label) control weight; feeds the class-id seg map rasterized "
+                         "from the sim COCO -> preserves object regions on the output.")
+    ap.add_argument("--depth-weight", type=float, default=0.5,
+                    help="depth control weight; feeds ground-truth Isaac depth -> geometry. "
+                         "Set 0 to disable depth control.")
+    ap.add_argument("--depth-dir", type=Path, default=None,
+                    help="dir of depth PNGs (default <sim-dir>/../depth).")
     ap.add_argument("--captions", type=Path, default=None,
                     help="JSON {stem: prompt} from caption_images.py -> per-image prompt "
                          "(falls back to the room template prompt if a stem is missing).")
@@ -99,50 +100,89 @@ def main():
         if not Path(r["ref"]).is_file():
             raise SystemExit(f"missing room reference image: {r['ref']}")
 
-    # DINOv2 embeddings: 3 room refs + all sim images -> nearest-room assignment
-    import measure_domain_gap as mdg
-    from transformers import AutoImageProcessor, AutoModel
-    dev = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
-    proc = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
-    dino = AutoModel.from_pretrained("facebook/dinov2-base").to(dev).eval()
-    ref_emb = np.asarray(mdg.embed_set([str(r["ref"]) for r in ROOMS], dino, proc, dev, 8, "dinov2"))
-    sim_emb = np.asarray(mdg.embed_set(sim_files, dino, proc, dev, 32, "dinov2"))
-    # cosine distance -> nearest room
-    refn = ref_emb / (np.linalg.norm(ref_emb, axis=1, keepdims=True) + 1e-9)
-    simn = sim_emb / (np.linalg.norm(sim_emb, axis=1, keepdims=True) + 1e-9)
-    assign = (simn @ refn.T).argmax(1)          # index into ROOMS per sim image
+    # Scene assignment is by the sim's OWN COCO labels (reliable) -- NOT DINOv2 nearest
+    # real-ref (sim != real in DINOv2 space, so it misclassifies). classify() below.
 
     caps = {}
     if args.captions and Path(args.captions).is_file():
         caps = json.loads(Path(args.captions).read_text())
         print(f"[cosmos-jobs] loaded {len(caps)} per-image captions from {args.captions}")
 
-    cfg_dir = args.out / "configs"
-    cfg_dir.mkdir(parents=True, exist_ok=True)
+    # control inputs: SEG (class-id label map rasterized from the sim COCO -> preserves
+    # object regions) + DEPTH (ground-truth Isaac depth -> geometry). Both fed to Cosmos.
+    import colorsys
+    from pycocotools.coco import COCO
+    from PIL import Image
+    pal = np.zeros((64, 3), np.uint8)
+    for i in range(1, 64):
+        r, g, b = colorsys.hsv_to_rgb((i * 0.61803) % 1.0, 0.65, 0.95)
+        pal[i] = (int(r * 255), int(g * 255), int(b * 255))
+    coco = COCO(str(args.sim_dir.parent / "_annotations.coco.json"))
+    stem2id = {Path(im["file_name"]).stem: i for i, im in coco.imgs.items()}
+    depth_dir = args.depth_dir or (args.sim_dir.parent / "depth")
+
+    # label-based scene classifier (ward / corridor / bathroom) from the sim COCO
+    nm = {c["id"]: c["name"] for c in coco.dataset["categories"]}
+    TOILET = {i for i, n in nm.items() if n in ("toilet", "toilet_handle", "shower")}
+    SINKMIR = {i for i, n in nm.items() if n in ("sink", "mirror")}
+    BINS = {i for i, n in nm.items() if n in ("soiled_linen_bin", "waste_bin", "medical_waste_container")}
+    BED = {i for i, n in nm.items() if n in ("hospital_bed", "bed_curtain", "overbed_table", "bedside_monitor")}
+    ROOM_IDX = {r["name"]: k for k, r in enumerate(ROOMS)}
+
+    def classify(img_id):
+        s = {a["category_id"] for a in coco.imgToAnns.get(img_id, [])}
+        if s & BED:                               # a bed dominates the frame -> ward
+            return "ward"                         # (even if a toilet door is visible)
+        if s & (TOILET | SINKMIR):                # no bed + bathroom fixture
+            return "bathroom"
+        if s & BINS:                              # no bed + bins
+            return "corridor"
+        return "ward"
+
+    cfg_dir = args.out / "configs"; seg_dir = args.out / "seg"
+    cfg_dir.mkdir(parents=True, exist_ok=True); seg_dir.mkdir(parents=True, exist_ok=True)
     out_root = (args.out / "outputs").resolve()
-    manifest, counts, n_cap = [], [0, 0, 0], 0
-    for p, ri in zip(sim_files, assign):
-        room = ROOMS[int(ri)]
-        counts[int(ri)] += 1
+    manifest, counts, n_cap, n_seg, n_depth = [], [0, 0, 0], 0, 0, 0
+    for p in sim_files:
         stem = Path(p).stem
-        prompt = caps.get(stem, room["prompt"])     # per-image caption, else room template
+        ri = ROOM_IDX[classify(stem2id.get(stem))]
+        room = ROOMS[ri]; counts[ri] += 1
+        prompt = caps.get(stem, room["prompt"])     # per-image caption, else scene-type prompt
         if stem in caps:
             n_cap += 1
+        controls = {}
+        img_id = stem2id.get(stem)
+        if img_id is not None:                      # SEG (label) control map
+            info = coco.imgs[img_id]; H, W = info["height"], info["width"]
+            seg = np.zeros((H, W, 3), np.uint8)
+            for a in coco.imgToAnns.get(img_id, []):
+                if a["category_id"] != 0:
+                    seg[coco.annToMask(a) > 0] = pal[a["category_id"] % 64]
+            segp = (seg_dir / f"{stem}.png").resolve()
+            Image.fromarray(seg).save(segp)
+            controls["seg"] = {"control_path": str(segp), "control_weight": args.seg_weight}
+            n_seg += 1
+        dpath = depth_dir / f"{stem}.png"           # DEPTH control
+        if args.depth_weight > 0 and dpath.is_file():
+            controls["depth"] = {"control_path": str(dpath.resolve()),
+                                 "control_weight": args.depth_weight}
+            n_depth += 1
         cfg = {
             "name": f"{room['name']}_{stem}",
             "prompt": prompt,
             "video_path": str(Path(p).resolve()),     # single image
-            "max_frames": 1,
-            "num_video_frames_per_chunk": 1,
+            "max_frames": 1, "num_video_frames_per_chunk": 1,
             "image_context_path": str(Path(room["ref"]).resolve()),
             "seed": args.seed,
-            args.control: {},                          # control computed on the fly
+            **controls,
         }
         (cfg_dir / f"{stem}.json").write_text(json.dumps(cfg, indent=2))
         manifest.append({"stem": stem, "room": room["name"], "config": str(cfg_dir / f"{stem}.json")})
 
     with open(args.out / "manifest.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["stem", "room", "config"]); w.writeheader(); w.writerows(manifest)
+    print(f"[cosmos-jobs] controls: seg={n_seg} (w={args.seg_weight}), "
+          f"depth={n_depth} (w={args.depth_weight})")
 
     # BATCH runner: pass ALL configs to one inference.py call so the 7B model is
     # loaded ONCE and every image runs sequentially (each with its own prompt).

@@ -22,13 +22,21 @@ import torch
 from PIL import Image
 
 INSTRUCTION = (
-    "You are writing a prompt for a photorealistic image generator. Look at this "
-    "hospital ward scene and describe it as ONE concise paragraph for generating a "
-    "REALISTIC photograph of a Taiwanese hospital ward room. Name the visible objects "
-    "(e.g. care bed, mattress, IV pole, vital-signs monitor, air-conditioner, wall "
-    "phone, bedside cabinet, privacy curtain, sink, toilet, grab bars), and describe "
-    "their materials and colors, the wall and floor finishes, and the lighting. Do NOT "
-    "mention that it is a 3D render, simulation, or CGI. Output only the prompt paragraph."
+    "You are writing a prompt to generate a REALISTIC photograph of a Taiwanese "
+    "hospital interior. The scene is ONE of three types: a patient WARD ROOM, a "
+    "CORRIDOR/hallway, or a BATHROOM. First decide which type it is, then describe the "
+    "visible objects and their spatial layout for that type "
+    "(ward room: care bed and mattress, IV pole, vital-signs monitor on an arm, "
+    "air-conditioner, wall phone, bedside cabinet, privacy curtain, window; "
+    "corridor: doors, handrails, signage, ceiling lights, long floor; "
+    "bathroom: toilet, wall-mounted sink, mirror, stainless grab bars, tiled walls). "
+    "Render it with REAL hospital materials and colors: cream/beige walls with "
+    "wood-grain laminate wainscot, light wood laminate floor in rooms and corridors, "
+    "white ceramic tiles in bathrooms, deep purple-navy mattresses with white bed "
+    "rails, mint-green privacy curtains, stainless-steel fixtures, soft natural "
+    "daylight. CRITICAL: IGNORE the colors shown in the image -- they are randomized "
+    "and NOT real; never say green/pink/blue/purple walls, mattress, books, or "
+    "furniture. Output only one concise prompt paragraph, no preamble."
 )
 
 
@@ -45,8 +53,8 @@ def main():
     ap.add_argument("--img-dir", type=Path, default=Path("ward_v3/train/images"))
     ap.add_argument("--out", type=Path, default=Path("cosmos_jobs/captions.json"))
     ap.add_argument("--model", default="Qwen/Qwen2-VL-2B-Instruct")
-    ap.add_argument("--max-new-tokens", type=int, default=180)
-    ap.add_argument("--max-side", type=int, default=768, help="downscale long side for speed")
+    ap.add_argument("--max-new-tokens", type=int, default=130)
+    ap.add_argument("--max-side", type=int, default=512, help="downscale long side for speed")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--device", default="0")
     args = ap.parse_args()
