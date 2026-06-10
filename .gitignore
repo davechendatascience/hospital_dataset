@@ -32,3 +32,4 @@ __pycache__/
 
 # Cosmos job configs + seg maps (regenerable, reference local paths)
 cosmos_jobs/
+ward_10k/
