@@ -501,6 +501,18 @@ def parse_args() -> argparse.Namespace:
                    help="weight of the MMD alignment loss.")
     p.add_argument("--align-batch", type=int, default=8,
                    help="real images per alignment step (more = steadier MMD).")
+    p.add_argument("--align-local", type=int, default=256,
+                   help="ALSO align per-LOCATION features: MMD over this many "
+                        "spatial positions sampled from the --align-local-level "
+                        "pyramid map (0 = global-only). Touches local structure "
+                        "the image-pooled term misses.")
+    p.add_argument("--align-local-level", type=int, default=1,
+                   help="pyramid level for local alignment (0=stride4 .. 3=stride32; "
+                        "earlier = lower-level structure, less class-sharp).")
+    p.add_argument("--align-ema", type=float, default=0.1,
+                   help="EMA update rate for per-domain feature means; adds an "
+                        "L2 penalty between EMA-stabilized means to tame "
+                        "small-batch MMD noise (0 = off).")
     p.add_argument("--eval-batch", type=int, default=2)
     p.add_argument("--score-thresh", type=float, default=0.5,
                    help="Min score for a predicted mask to count in eval")
@@ -964,6 +976,36 @@ def main() -> None:
         kxx, kyy, kxy = k[:n, :n], k[n:, n:], k[:n, n:]
         return kxx.mean() + kyy.mean() - 2 * kxy.mean()
 
+    def _local_feats(fmaps, level, n):
+        f = fmaps[min(level, len(fmaps) - 1)].float()   # (B, C, H, W)
+        x = f.permute(0, 2, 3, 1).reshape(-1, f.shape[1])
+        idx = torch.randperm(x.shape[0], device=x.device)[:n]
+        return x[idx]
+
+    _ema = {"s": None, "t": None}
+
+    def _align_loss(f_sim, f_real):
+        """global pooled MMD + local per-location MMD + EMA-mean L2."""
+        a = _pool_pyramid(f_sim)
+        b = _pool_pyramid(f_real)
+        total = _mmd(a, b)
+        if args.align_local > 0:
+            total = total + _mmd(
+                _local_feats(f_sim, args.align_local_level, args.align_local),
+                _local_feats(f_real, args.align_local_level, args.align_local))
+        if args.align_ema > 0:
+            mu_s = torch.nn.functional.normalize(a, dim=1).mean(0)
+            mu_t = torch.nn.functional.normalize(b, dim=1).mean(0)
+            r = args.align_ema
+            if _ema["s"] is None:
+                _ema["s"], _ema["t"] = mu_s.detach(), mu_t.detach()
+            es = (1 - r) * _ema["s"] + r * mu_s        # grad via current batch
+            et = (1 - r) * _ema["t"] + r * mu_t
+            total = total + (es - et).pow(2).sum()
+            _ema["s"] = ((1 - r) * _ema["s"] + r * mu_s.detach())
+            _ema["t"] = ((1 - r) * _ema["t"] + r * mu_t.detach())
+        return total
+
     # ----- train loop ----------------------------------------------------- #
     try:
         from tqdm import tqdm
@@ -1017,7 +1059,7 @@ def main() -> None:
                     enc = model.model.pixel_level_module.encoder
                     f_sim = enc(pixel_values).feature_maps
                     f_real = enc(real_pv).feature_maps
-                    align = _mmd(_pool_pyramid(f_sim), _pool_pyramid(f_real))
+                    align = _align_loss(f_sim, f_real)
                     loss = loss + args.align_weight * align
                     running_align += align.item()
             loss.backward()
