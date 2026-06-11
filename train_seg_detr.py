@@ -362,7 +362,8 @@ def parse_args() -> argparse.Namespace:
                    help="HF model id (Mask2Former / MaskFormer instance-seg checkpoint). "
                         "For --backbone dinov2 this is the decoder warm-start source.")
     p.add_argument("--backbone", choices=["swin", "dinov2", "gfn"], default="swin",
-                   help="swin = fully fine-tune the COCO Mask2Former (default). "
+                   help="swin = COCO Mask2Former (backbone frozen by default; "
+                        "--no-freeze-backbone to fully fine-tune). "
                         "dinov2 = frozen DINOv2 ViT + Simple Feature Pyramid. "
                         "gfn = Gist-First Network (global-first: gist from frozen "
                         "DINOv2 gates a top-down pyramid). All warm-start the "
@@ -372,11 +373,12 @@ def parse_args() -> argparse.Namespace:
                         "facebook/dinov2-large, facebook/dinov2-with-registers-base.")
     p.add_argument("--freeze-backbone", dest="freeze_backbone",
                    action="store_true", default=True,
-                   help="(dinov2) freeze the ViT; train only FPN + decoder (default).")
+                   help="freeze the backbone (swin encoder / DINOv2 ViT); train "
+                        "only pyramid + decoder + heads (default).")
     p.add_argument("--no-freeze-backbone", dest="freeze_backbone",
                    action="store_false",
-                   help="(dinov2/gfn) also fine-tune the ViT (ablation: higher sim "
-                        "AP, expected lower real AP).")
+                   help="also fine-tune the backbone (ablation: higher sim AP, "
+                        "expected lower real AP).")
     p.add_argument("--gfn-gate", dest="gfn_gate", action="store_true", default=True,
                    help="(gfn) FiLM-gate the pyramid with the gist + seed the "
                         "coarsest level from it (default on).")
@@ -698,6 +700,16 @@ def main() -> None:
             num_labels=NUM_LABELS,
             ignore_mismatched_sizes=True,  # re-init class head 80 -> 43
         )
+        if args.freeze_backbone:
+            # freeze the (COCO-pretrained) Swin encoder; train only the pixel
+            # decoder + transformer decoder + heads -- same regime as the
+            # frozen dinov2/gfn paths so backbone comparisons are like-for-like
+            enc = model.model.pixel_level_module.encoder
+            for p_ in enc.parameters():
+                p_.requires_grad_(False)
+            enc.eval()
+            print("[seg-detr] swin backbone FROZEN "
+                  "(--no-freeze-backbone to fine-tune it)", flush=True)
     model.to(device)
 
     # ----- data ----------------------------------------------------------- #
@@ -810,6 +822,11 @@ def main() -> None:
 
     for epoch in range(1, args.epochs + 1):
         model.train()
+        if args.backbone == "swin" and args.freeze_backbone:
+            # keep the frozen Swin encoder in eval mode (model.train() would
+            # re-enable its stochastic depth); dinov2/gfn handle this in their
+            # own .train() overrides
+            model.model.pixel_level_module.encoder.eval()
         running = 0.0
         running_aux = 0.0
         n_steps = 0
