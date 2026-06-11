@@ -490,6 +490,17 @@ def parse_args() -> argparse.Namespace:
                         "epoch from --overlay-split (qualitative inspection).")
     p.add_argument("--overlay-split", default=None,
                    help="Split to draw overlays from (default: first eval split).")
+    p.add_argument("--align-real", type=Path, default=None,
+                   help="dir of UNLABELED real images (e.g. ward_v4/real_dev/"
+                        "images): adds an MMD loss pulling the encoder's pooled "
+                        "pyramid features on the sim batch toward this set's "
+                        "distribution (unsupervised domain adaptation). Needs "
+                        "trainable encoder params (dinov2/gfn/lejepa "
+                        "projections, or --no-freeze-backbone swin).")
+    p.add_argument("--align-weight", type=float, default=0.1,
+                   help="weight of the MMD alignment loss.")
+    p.add_argument("--align-batch", type=int, default=8,
+                   help="real images per alignment step (more = steadier MMD).")
     p.add_argument("--eval-batch", type=int, default=2)
     p.add_argument("--score-thresh", type=float, default=0.5,
                    help="Min score for a predicted mask to count in eval")
@@ -900,6 +911,59 @@ def main() -> None:
         print("[seg-detr] baseline eval (epoch 0, untrained class head)")
         run_eval(0, float("nan"))
 
+    # ----- real-distribution alignment (unsupervised DA) ------------------ #
+    align_iter = None
+    if args.align_real is not None:
+        align_paths = sorted(p for p in Path(args.align_real).iterdir()
+                             if p.suffix.lower() in (".jpg", ".png", ".jpeg"))
+        if not align_paths:
+            raise SystemExit(f"--align-real: no images in {args.align_real}")
+        enc_has_grad = any(p.requires_grad for p in
+                           model.model.pixel_level_module.encoder.parameters())
+        if not enc_has_grad:
+            print("[seg-detr] WARNING: --align-real set but the encoder has no "
+                  "trainable params (fully frozen swin?) -> alignment is a "
+                  "no-op. Use dinov2/gfn/lejepa or --no-freeze-backbone.")
+
+        class _RealImgs(Dataset):
+            def __len__(self):
+                return len(align_paths)
+
+            def __getitem__(self, i):
+                return Image.open(align_paths[i]).convert("RGB")
+
+        def _real_collate(ims):
+            enc = processor(images=ims, return_tensors="pt")
+            return enc["pixel_values"]
+
+        _real_loader = DataLoader(_RealImgs(), batch_size=args.align_batch,
+                                  shuffle=True, drop_last=True,
+                                  num_workers=2, collate_fn=_real_collate)
+
+        def _cycle(dl):
+            while True:
+                for b in dl:
+                    yield b
+        align_iter = _cycle(_real_loader)
+        print(f"[seg-detr] real-alignment ON: {len(align_paths)} unlabeled "
+              f"images from {args.align_real}, weight={args.align_weight}, "
+              f"batch={args.align_batch}")
+
+    def _pool_pyramid(fmaps):
+        return torch.cat([f.float().mean(dim=(2, 3)) for f in fmaps], dim=1)
+
+    def _mmd(a, b):
+        """Multi-bandwidth RBF MMD^2 (biased) on L2-normalized features."""
+        a = torch.nn.functional.normalize(a, dim=1)
+        b = torch.nn.functional.normalize(b, dim=1)
+        x = torch.cat([a, b], 0)
+        d2 = torch.cdist(x, x).pow(2)
+        med = d2.detach().flatten().median().clamp_min(1e-6)
+        k = sum(torch.exp(-d2 / (g * med)) for g in (0.5, 1.0, 2.0))
+        n = a.shape[0]
+        kxx, kyy, kxy = k[:n, :n], k[n:, n:], k[:n, n:]
+        return kxx.mean() + kyy.mean() - 2 * kxy.mean()
+
     # ----- train loop ----------------------------------------------------- #
     try:
         from tqdm import tqdm
@@ -916,6 +980,7 @@ def main() -> None:
             model.model.pixel_level_module.encoder.eval()
         running = 0.0
         running_aux = 0.0
+        running_align = 0.0
         n_steps = 0
         t0 = time.time()
         pbar = tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}")
@@ -947,6 +1012,14 @@ def main() -> None:
                             aux_logits.float(), target)
                         loss = loss + gfn_aux_weight * aux_loss
                         running_aux += aux_loss.item()
+                if align_iter is not None:
+                    real_pv = next(align_iter).to(device)
+                    enc = model.model.pixel_level_module.encoder
+                    f_sim = enc(pixel_values).feature_maps
+                    f_real = enc(real_pv).feature_maps
+                    align = _mmd(_pool_pyramid(f_sim), _pool_pyramid(f_real))
+                    loss = loss + args.align_weight * align
+                    running_align += align.item()
             loss.backward()
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -962,6 +1035,8 @@ def main() -> None:
         train_loss = running / max(n_steps, 1)
         aux_note = (f" aux={running_aux / max(n_steps, 1):.4f}"
                     if gfn_aux_weight > 0 else "")
+        if align_iter is not None:
+            aux_note += f" align_mmd={running_align / max(n_steps, 1):.4f}"
         print(f"[seg-detr] epoch {epoch} done: train_loss={train_loss:.4f}{aux_note} "
               f"({time.time() - t0:.0f}s)")
 
