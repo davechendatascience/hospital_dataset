@@ -94,6 +94,10 @@ def parse_args():
                    help="Max XY translation (m) per cluster for --randomize-placement.")
     p.add_argument("--placement-seed", type=int, default=0,
                    help="Seed for placement DR (default: --seed).")
+    p.add_argument("--placement-global-frac", type=float, default=0.35,
+                   help="Probability that a floor item is re-placed ANYWHERE "
+                        "in its room (collision-checked) instead of jittered "
+                        "near its original spot. 0 = local-only (v2 behavior).")
     p.add_argument("--extra-channels", action="store_true", default=False,
                    help="Also export ground-truth DEPTH (distance_to_camera + "
                         "distance_to_image_plane), surface NORMALS, and stable "
@@ -1097,7 +1101,8 @@ if args.randomize_placement:
     (Path(args.out) / "_placement_inputs.json").write_text(json.dumps(_dump))
     _seq_all = placement_dr.generate(
         object_targets, rooms, floor_z, n_frames=args.frames,
-        seed=_pseed, max_shift=args.placement_shift, wall_boxes=wall_aabbs)
+        seed=_pseed, max_shift=args.placement_shift, wall_boxes=wall_aabbs,
+        global_frac=args.placement_global_frac)
     PLACEMENT_SEQ = {p: s for p, s in _seq_all.items() if len(set(s)) > 1}
     _ot_by_path = {o["path"]: o for o in object_targets}
     print(f"[placement-dr] {len(PLACEMENT_SEQ)}/{len(_seq_all)} objects move "

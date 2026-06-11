@@ -107,6 +107,9 @@ def parse_args() -> argparse.Namespace:
                         "automatically (rendered from the moved scene).")
     p.add_argument("--placement-shift", type=float, default=0.8,
                    help="Max XY cluster translation (m) for --randomize-placement.")
+    p.add_argument("--placement-global-frac", type=float, default=0.35,
+                   help="Forward to replicator: probability of whole-room floor "
+                        "re-placement vs local jitter (see placement_dr.py).")
     p.add_argument("--train-seed", type=int, default=42)
     p.add_argument("--val-seed",   type=int, default=43)
     p.add_argument("--skip-render", action="store_true",
@@ -209,7 +212,8 @@ def run_replicator(args: argparse.Namespace, split: str, n_frames: int,
     if getattr(args, "randomize_materials", False):
         cmd += ["--randomize-materials"]
     if getattr(args, "randomize_placement", False):
-        cmd += ["--randomize-placement", "--placement-shift", str(args.placement_shift)]
+        cmd += ["--randomize-placement", "--placement-shift", str(args.placement_shift),
+                "--placement-global-frac", str(args.placement_global_frac)]
     print(f"[render] {split}: invoking replicator with {n_frames} frames "
           f"(seed={seed}) -> {render_root}")
     print("        $", " ".join(cmd))

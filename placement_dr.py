@@ -9,8 +9,8 @@ policy as a room-level hierarchy:
    |    pole) + the wall-equipment groups mounted ABOVE the bed (monitor, gas
    |    manifold, flowmeter, suction, wall phone). The whole bay slides as ONE
    |    rigid unit ALONG the headwall (1D), staying flush to the wall, avoiding
-   |    doors, fixtures and other wall groups. This mirrors how real wards
-   |    differ: the bed bay shifts along the wall, its equipment with it.
+   |    doors, fixtures and other wall groups. Satellites additionally jitter
+   |    ALONG the bed (member-aware, grandfathered collision).
    |- WALL GROUPS: remaining wall equipment, clustered by attachment (XY gap
    |    <= link_gap), slides along ITS wall only (the perpendicular coordinate
    |    is never touched, so items stay exactly ON the wall plane) with 1D
@@ -29,7 +29,9 @@ Collision is Z-AWARE: a blocker only conflicts with a move if their footprints
 overlap in XY *and* their height ranges intersect. Without this, overhead
 fixtures (bed curtain rail, air vents) would freeze the furniture below them --
 in reality a bed slides under its curtain rail, an overbed table slides under
-the wall phone. Door keep-outs span full height on purpose.
+the wall phone. Door keep-outs span full height on purpose. Pairs that already
+coexist in the ORIGINAL layout are GRANDFATHERED (the air vent was always
+above the bed; that is not a new collision).
 
 Every randomized move is rejection-sampled against the constraint set and
 falls back to the ORIGINAL pose (always valid by construction), so a frame can
@@ -38,11 +40,18 @@ bookkeeping is conservative: while placing item N, the not-yet-placed items
 count as obstacles at their ORIGINAL spots, so "everyone stays put" is always
 a consistent solution and the system cannot deadlock into overlap.
 
+Two entry points share ALL of the above machinery:
+  * generate(...)      -- engine SAMPLES every degree of freedom (rng)
+  * apply_layout(...)  -- a caller (e.g. an LLM layout designer) PROPOSES the
+                          degrees of freedom; the engine validates each one and
+                          falls back to the original pose for any that violate
+                          constraints, returning what was rejected and why.
+
 Pure Python (no Isaac imports) so the whole policy is unit-testable. The
 caller provides object_targets augmented with 'translate' (original world
 translate) and 'room', the room XY AABBs, floor_z, and optionally the wall
-mesh AABBs for clip checks. Returns {prim_path: [(x, y, z) per frame]}.
-Orientation is never authored, so nothing can tip or yaw implausibly.
+mesh AABBs for clip checks. Positions are {prim_path: (x, y, z)}; orientation
+is never authored, so nothing can tip or yaw implausibly.
 """
 from __future__ import annotations
 
@@ -181,13 +190,12 @@ def _components(items, link_gap):
     return list(comp.values())
 
 
-# ------------------------------------------------------------------ policy --
-def generate(object_targets, rooms, floor_z, n_frames, seed=1000,
-             max_shift=0.8, wall_slide=0.2, sat_slide=0.5, attempts=40,
-             wall_boxes=None, door_clearance=0.5, link_gap=0.25, verbose=True):
-    """-> {path: [(x, y, z)] * n_frames}. Each target must carry 'translate'
-    (original world translate) and 'room' (room name from the renderer)."""
-    rng = random.Random(seed)
+# ------------------------------------------------------------- scene build --
+def _build_ctx(object_targets, rooms, floor_z, max_shift=0.8, wall_slide=0.2,
+               sat_slide=0.5, wall_boxes=None, door_clearance=0.5,
+               link_gap=0.25, global_frac=0.0, verbose=True):
+    """Resolve roles, groups, bays and every precomputed constraint table.
+    The returned ctx is consumed by _solve() (one call per frame/layout)."""
     objs = sorted(object_targets, key=lambda o: o["path"])
     for o in objs:
         if "translate" not in o:
@@ -292,7 +300,7 @@ def generate(object_targets, rooms, floor_z, n_frames, seed=1000,
                  for p in members]
         bays.append({"key": key, "axis": axis, "members": members,
                      "iv": iv, "blks": blks, "m_ivs": m_ivs,
-                     "z": (min(b[1] for b in blks), max(b[2] for b in blks))})
+                     "z": (min(q[1] for q in blks), max(q[2] for q in blks))})
 
     # ---- static obstacles (Z-aware blockers) ----
     fixtures = [o for o in objs if roles[o["path"]] == "fixture"]
@@ -318,10 +326,6 @@ def generate(object_targets, rooms, floor_z, n_frames, seed=1000,
                 wall_static[key].append(((lo - pad, hi + pad),
                                          o["aabb"][0][2], o["aabb"][1][2]))
 
-    def axis_span(room, axis):
-        return ((room["xmin"], room["xmax"]) if axis == "x"
-                else (room["ymin"], room["ymax"]))
-
     floor_movers = sorted((o for o in objs if roles[o["path"]] == "floor"),
                           key=lambda o: -(o["size"][0] * o["size"][1]))
     surface_items = [o for o in objs if roles[o["path"]] == "surface"]
@@ -342,11 +346,39 @@ def generate(object_targets, rooms, floor_z, n_frames, seed=1000,
 
     bay_walls = [[(bi_f, w) for bi_f, blk in enumerate(b["blks"])
                   for w in _near_walls(blk, max_shift + 0.05)] for b in bays]
+    floor_walls = {o["path"]: _near_walls(orig_blks[o["path"]], max_shift + 0.05)
+                   for o in floor_movers}
+    # for LONG-RANGE moves (global sampling / LLM proposals) the near-list is
+    # not enough: keep all wall blocks + each mover's originally-touched set
+    floor_wall_exempt = {}
+    for o in floor_movers:
+        blk = orig_blks[o["path"]]
+        floor_wall_exempt[o["path"]] = {
+            i for i, w in enumerate(wb_blks) if _blk_hit(blk, w, margin=0.02)}
+    # GRANDFATHER: obstacles the ORIGINAL pose already conflicts with don't
+    # count (the linen bin lives inside the door keep-out in the real ward --
+    # "stay there" or "shift 10 cm" must not be rejected because of it)
+    floor_gf = {}
+    bay_member_blk = {}
+    for b in bays:
+        for mi, p in enumerate(b["members"]):
+            bay_member_blk[p] = b["blks"][mi]
+    for o in floor_movers:
+        blk = orig_blks[o["path"]]
+        gf = set()
+        for si, q in enumerate(static_blks):
+            if _blk_hit(blk, q, margin=0.03):
+                gf.add(f"static:{si}")
+        for p2, q in bay_member_blk.items():
+            if p2 != o["path"] and _blk_hit(blk, q, margin=0.03):
+                gf.add(p2)
+        for o2 in floor_movers:
+            if o2["path"] != o["path"] and \
+               _blk_hit(blk, orig_blks[o2["path"]], margin=0.03):
+                gf.add(o2["path"])
+        floor_gf[o["path"]] = gf
 
-    # per-member 1D wall checks for each bay: member interval vs the wall's
-    # OTHER occupants, only where their height ranges intersect, and with
-    # pairs that already coexist in the original layout GRANDFATHERED (the
-    # air vent was always above the bed; that is not a new collision).
+    # per-member 1D wall + reduced-static checks for each bay, grandfathered
     for b in bays:
         occ = list(wall_static[b["key"]])
         occ += [(g["iv"], g["z"][0], g["z"][1]) for g in wall_groups
@@ -364,10 +396,7 @@ def generate(object_targets, rooms, floor_z, n_frames, seed=1000,
                     continue                      # grandfathered coexistence
                 pairs.append((miv, qiv))
             # static 3D blockers reduce to slide-axis interval pairs too (the
-            # perpendicular coordinate never changes during a slide): keep
-            # only blockers that overlap the member in Z and in the
-            # perpendicular axis, lie within slide reach, and do NOT already
-            # coexist at s=0.
+            # perpendicular coordinate never changes during a slide)
             r = mb[0]
             for q in stat:
                 if not _zov(mb[1], mb[2], q[1], q[2]):
@@ -388,8 +417,6 @@ def generate(object_targets, rooms, floor_z, n_frames, seed=1000,
                 pairs.append((a, qiv))
             pairs_m.append(pairs)
         b["pairs_m"] = pairs_m
-    floor_walls = {o["path"]: _near_walls(orig_blks[o["path"]], max_shift + 0.05)
-                   for o in floor_movers}
 
     if verbose:
         hist = defaultdict(int)
@@ -405,201 +432,354 @@ def generate(object_targets, rooms, floor_z, n_frames, seed=1000,
               f"floor movers: {len(floor_movers)}, "
               f"surface riders: {len(surface_items)}")
 
-    # ------------------------------------------------------------ frames --
-    out = {o["path"]: [] for o in objs}
     riders_of = defaultdict(list)
     for o in surface_items:
         riders_of[support_of[o["path"]]].append(o)
 
-    for _f in range(n_frames):
-        delta = {}
+    return {
+        "objs": objs, "by_room": by_room, "obj_by_path": obj_by_path,
+        "pos0": pos0, "roles": roles, "support_of": support_of,
+        "wall_groups": wall_groups, "bays": bays,
+        "static_blks": static_blks, "wall_static": wall_static,
+        "floor_movers": floor_movers, "orig_blks": orig_blks,
+        "bay_walls": bay_walls, "floor_walls": floor_walls,
+        "wb_blks": wb_blks, "floor_wall_exempt": floor_wall_exempt,
+        "floor_gf": floor_gf,
+        "riders_of": riders_of,
+        "max_shift": max_shift, "wall_slide": wall_slide,
+        "sat_slide": sat_slide, "global_frac": global_frac,
+    }
 
-        # 1) bed bays -- rigid 1D slide along the headwall
-        placed_bays = {}
-        for bi, b in enumerate(bays):
-            key = b["key"]
-            room = by_room[key[0]]
-            lo, hi = axis_span(room, b["axis"])
-            lo, hi = min(lo, b["iv"][0]), max(hi, b["iv"][1])
-            dyn = []                       # other bays sharing this wall (1D)
-            dyn_blks = []                  # other bays' member blockers (3D)
-            for bj, ob in enumerate(bays):
-                if bj == bi:
-                    continue
-                if ob["key"] == key:
-                    dyn.append(placed_bays[bj][1] if bj in placed_bays
-                               else ob["iv"])
-                if bj in placed_bays:
-                    s_j = placed_bays[bj][0]
-                    dxy_j = (s_j, 0.0) if ob["axis"] == "x" else (0.0, s_j)
-                    dyn_blks += [_blk_shift(q, *dxy_j) for q in ob["blks"]]
+
+def _axis_span(room, axis):
+    return ((room["xmin"], room["xmax"]) if axis == "x"
+            else (room["ymin"], room["ymax"]))
+
+
+# ------------------------------------------------------------- one layout --
+def _solve(ctx, rng, attempts=40, params=None):
+    """Produce ONE collision-valid layout: {path: (x, y, z)}.
+
+    params=None        -> every degree of freedom is rng-sampled (generate()).
+    params={...}       -> proposed values are validated ONCE each and rejected
+                          (-> original pose) if they violate constraints:
+        {"bay_slides":  {bay_index: s},          # along the headwall
+         "sat_slides":  {path: t},               # along the bed, extra to bay
+         "wall_slides": {group_index: s},        # along the group's wall
+         "floor":       {path: (x, y)}}          # new world centre XY
+    Returns (positions, rejected) -- rejected is a list of strings."""
+    proposal_mode = params is not None
+    params = params or {}
+    rejected = []
+    bays = ctx["bays"]
+    wall_groups = ctx["wall_groups"]
+    by_room = ctx["by_room"]
+    roles = ctx["roles"]
+    obj_by_path = ctx["obj_by_path"]
+    max_shift, wall_slide, sat_slide = (ctx["max_shift"], ctx["wall_slide"],
+                                        ctx["sat_slide"])
+    delta = {}
+
+    # 1) bed bays -- rigid 1D slide along the headwall
+    placed_bays = {}
+    for bi, b in enumerate(bays):
+        key = b["key"]
+        room = by_room[key[0]]
+        lo, hi = _axis_span(room, b["axis"])
+        lo, hi = min(lo, b["iv"][0]), max(hi, b["iv"][1])
+        dyn = []                       # other bays sharing this wall (1D)
+        dyn_blks = []                  # other bays' member blockers (3D)
+        for bj, ob in enumerate(bays):
+            if bj == bi:
+                continue
+            if ob["key"] == key:
+                dyn.append(placed_bays[bj][1] if bj in placed_bays
+                           else ob["iv"])
+            if bj in placed_bays:
+                s_j = placed_bays[bj][0]
+                dxy_j = (s_j, 0.0) if ob["axis"] == "x" else (0.0, s_j)
+                dyn_blks += [_blk_shift(q, *dxy_j) for q in ob["blks"]]
+            else:
+                dyn_blks += ob["blks"]
+
+        def _bay_ok(cand):
+            iv = (b["iv"][0] + cand, b["iv"][1] + cand)
+            if iv[0] < lo or iv[1] > hi:
+                return False
+            if any(_iv_overlap((a[0] + cand, a[1] + cand), q, margin=0.03)
+                   for pm in b["pairs_m"] for a, q in pm):
+                return False
+            if any(_iv_overlap(iv, q, margin=0.05) for q in dyn):
+                return False
+            dxy = (cand, 0.0) if b["axis"] == "x" else (0.0, cand)
+            moved = [_blk_shift(q, *dxy) for q in b["blks"]]
+            if dyn_blks and any(_blk_hit(mq, q, margin=0.03)
+                                for mq in moved for q in dyn_blks):
+                return False
+            if any(_rect_overlap(moved[fi][0], w[0])
+                   for fi, w in ctx["bay_walls"][bi]):
+                return False
+            return True
+
+        s = 0.0
+        if proposal_mode:
+            prop = params.get("bay_slides", {}).get(bi)
+            if prop is not None:
+                cand = max(-max_shift, min(max_shift, float(prop)))
+                if _bay_ok(cand):
+                    s = cand
                 else:
-                    dyn_blks += ob["blks"]
-            s = 0.0
+                    rejected.append(f"bay_slides[{bi}]={prop:.2f}")
+        else:
             for _ in range(attempts):
                 cand = rng.uniform(-max_shift, max_shift)
-                iv = (b["iv"][0] + cand, b["iv"][1] + cand)
-                if iv[0] < lo or iv[1] > hi:
-                    continue
-                if any(_iv_overlap((a[0] + cand, a[1] + cand), q, margin=0.03)
-                       for pm in b["pairs_m"] for a, q in pm):
-                    continue
-                if any(_iv_overlap(iv, q, margin=0.05) for q in dyn):
-                    continue
-                dxy = (cand, 0.0) if b["axis"] == "x" else (0.0, cand)
-                moved = [_blk_shift(q, *dxy) for q in b["blks"]]
-                if dyn_blks and any(_blk_hit(mq, q, margin=0.03)
-                                    for mq in moved for q in dyn_blks):
-                    continue
-                if any(_rect_overlap(moved[fi][0], w[0])
-                       for fi, w in bay_walls[bi]):
-                    continue
-                s = cand
-                break
-            placed_bays[bi] = (s, (b["iv"][0] + s, b["iv"][1] + s))
-            dxy = (s, 0.0) if b["axis"] == "x" else (0.0, s)
-            for p in b["members"]:
-                delta[p] = dxy
+                if _bay_ok(cand):
+                    s = cand
+                    break
+        placed_bays[bi] = (s, (b["iv"][0] + s, b["iv"][1] + s))
+        dxy = (s, 0.0) if b["axis"] == "x" else (0.0, s)
+        for p in b["members"]:
+            delta[p] = dxy
 
-            # satellites additionally jitter ALONG the bed (an overbed table's
-            # position down the bed length varies a lot in reality), staying
-            # at the bed, respecting the same non-grandfathered pairs, and
-            # never NEWLY overlapping another bay member (overbed-table-over-
-            # bed is grandfathered; bedside-table-into-bed is not).
-            bediv = b["m_ivs"][0][0]            # members[0] is the bed
-            cur = {mi2: _blk_shift(b["blks"][mi2], *dxy)
-                   for mi2 in range(len(b["members"]))}
-            for mi, p in enumerate(b["members"]):
-                if roles[p] != "satellite":
-                    continue
-                mb = b["blks"][mi]
-                miv = b["m_ivs"][mi][0]
-                t = 0.0
+        # satellites additionally jitter ALONG the bed, staying at the bed,
+        # respecting the same non-grandfathered pairs, and never NEWLY
+        # overlapping another bay member (overbed-table-over-bed stays
+        # grandfathered; bedside-table-into-bed is not).
+        bediv = b["m_ivs"][0][0]            # members[0] is the bed
+        cur = {mi2: _blk_shift(b["blks"][mi2], *dxy)
+               for mi2 in range(len(b["members"]))}
+        for mi, p in enumerate(b["members"]):
+            if roles[p] != "satellite":
+                continue
+            mb = b["blks"][mi]
+            miv = b["m_ivs"][mi][0]
+
+            def _sat_ok(c2):
+                tot = s + c2
+                niv = (miv[0] + tot, miv[1] + tot)
+                if niv[0] < bediv[0] + s - 0.45 or \
+                   niv[1] > bediv[1] + s + 0.45:
+                    return False              # must stay AT the bed
+                if any(_iv_overlap((a[0] + tot, a[1] + tot), q, margin=0.03)
+                       for a, q in b["pairs_m"][mi]):
+                    return False
+                dxy2 = (tot, 0.0) if b["axis"] == "x" else (0.0, tot)
+                nb = _blk_shift(mb, *dxy2)
+                if any(_blk_hit(nb, cur[mj], margin=0.02)
+                       and not _blk_hit(mb, b["blks"][mj], margin=0.02)
+                       for mj in range(len(b["members"])) if mj != mi):
+                    return False
+                return True
+
+            t = 0.0
+            if proposal_mode:
+                prop = params.get("sat_slides", {}).get(p)
+                if prop is not None:
+                    c2 = max(-sat_slide, min(sat_slide, float(prop)))
+                    if _sat_ok(c2):
+                        t = c2
+                    else:
+                        rejected.append(f"sat_slides[{obj_by_path[p]['class']}]"
+                                        f"={prop:.2f}")
+            else:
                 for _ in range(20):
                     c2 = rng.uniform(-sat_slide, sat_slide)
-                    tot = s + c2
-                    niv = (miv[0] + tot, miv[1] + tot)
-                    if niv[0] < bediv[0] + s - 0.45 or \
-                       niv[1] > bediv[1] + s + 0.45:
-                        continue              # must stay AT the bed
-                    if any(_iv_overlap((a[0] + tot, a[1] + tot), q,
-                                       margin=0.03)
-                           for a, q in b["pairs_m"][mi]):
-                        continue
-                    dxy2 = (tot, 0.0) if b["axis"] == "x" else (0.0, tot)
-                    nb = _blk_shift(mb, *dxy2)
-                    if any(_blk_hit(nb, cur[mj], margin=0.02)
-                           and not _blk_hit(mb, b["blks"][mj], margin=0.02)
-                           for mj in range(len(b["members"])) if mj != mi):
-                        continue
-                    t = c2
-                    break
-                dxy2 = ((s + t, 0.0) if b["axis"] == "x" else (0.0, s + t))
-                cur[mi] = _blk_shift(mb, *dxy2)
-                delta[p] = dxy2
+                    if _sat_ok(c2):
+                        t = c2
+                        break
+            dxy2 = ((s + t, 0.0) if b["axis"] == "x" else (0.0, s + t))
+            cur[mi] = _blk_shift(mb, *dxy2)
+            delta[p] = dxy2
 
-        # 2) independent wall groups -- 1D slide, never overlapping the wall
-        g_now = {}
-        for gi, g in enumerate(wall_groups):
-            if g["in_bay"]:
+    # 2) independent wall groups -- 1D slide, never overlapping the wall
+    g_now = {}
+    for gi, g in enumerate(wall_groups):
+        if g["in_bay"]:
+            continue
+        key = g["key"]
+        room = by_room[key[0]]
+        lo, hi = _axis_span(room, key[2])
+        lo, hi = min(lo, g["iv"][0]), max(hi, g["iv"][1])
+        obstacles = [iv for (iv, qz0, qz1) in ctx["wall_static"][key]
+                     if _zov(g["z"][0], g["z"][1], qz0, qz1)]
+        for gj, g2 in enumerate(wall_groups):
+            if gj == gi or g2["in_bay"] or g2["key"] != key:
                 continue
-            key = g["key"]
-            room = by_room[key[0]]
-            lo, hi = axis_span(room, key[2])
-            lo, hi = min(lo, g["iv"][0]), max(hi, g["iv"][1])
-            obstacles = [iv for (iv, qz0, qz1) in wall_static[key]
-                         if _zov(g["z"][0], g["z"][1], qz0, qz1)]
-            for gj, g2 in enumerate(wall_groups):
-                if gj == gi or g2["in_bay"] or g2["key"] != key:
-                    continue
-                if _zov(g["z"][0], g["z"][1], g2["z"][0], g2["z"][1]):
-                    obstacles.append(g_now.get(gj, g2["iv"]))
-            for bj, ob in enumerate(bays):
-                if ob["key"] == key:
-                    obstacles.append(placed_bays[bj][1])
-            s = 0.0
+            if _zov(g["z"][0], g["z"][1], g2["z"][0], g2["z"][1]):
+                obstacles.append(g_now.get(gj, g2["iv"]))
+        for bj, ob in enumerate(bays):
+            if ob["key"] == key:
+                obstacles.append(placed_bays[bj][1])
+
+        def _grp_ok(cand):
+            iv = (g["iv"][0] + cand, g["iv"][1] + cand)
+            if iv[0] < lo or iv[1] > hi:
+                return False
+            return not any(_iv_overlap(iv, q, margin=0.03) for q in obstacles)
+
+        s = 0.0
+        if proposal_mode:
+            prop = params.get("wall_slides", {}).get(gi)
+            if prop is not None:
+                cand = max(-wall_slide, min(wall_slide, float(prop)))
+                if _grp_ok(cand):
+                    s = cand
+                else:
+                    rejected.append(f"wall_slides[{gi}]={prop:.2f}")
+        else:
             for _ in range(attempts):
                 cand = rng.uniform(-wall_slide, wall_slide)
-                iv = (g["iv"][0] + cand, g["iv"][1] + cand)
-                if iv[0] < lo or iv[1] > hi:
-                    continue
-                if any(_iv_overlap(iv, q, margin=0.03) for q in obstacles):
-                    continue
-                s = cand
-                break
-            g_now[gi] = (g["iv"][0] + s, g["iv"][1] + s)
-            dxy = (s, 0.0) if key[2] == "x" else (0.0, s)
-            for p in g["members"]:
-                delta[p] = dxy
+                if _grp_ok(cand):
+                    s = cand
+                    break
+        g_now[gi] = (g["iv"][0] + s, g["iv"][1] + s)
+        dxy = (s, 0.0) if key[2] == "x" else (0.0, s)
+        for p in g["members"]:
+            delta[p] = dxy
 
-        # 3) floor furniture -- local 2D re-place with full collision
-        placed_blks = list(static_blks)
-        for b in bays:                      # members at their FINAL deltas
-            for mi, p in enumerate(b["members"]):
-                placed_blks.append(_blk_shift(b["blks"][mi], *delta[p]))
-        pending = dict(orig_blks)
-        for o in floor_movers:
-            p = o["path"]
-            room = by_room[o["room"]]
-            del pending[p]
-            f0, z0, z1 = orig_blks[p]
-            rxlo, rxhi = min(room["xmin"], f0[0]), max(room["xmax"], f0[2])
-            rylo, ryhi = min(room["ymin"], f0[1]), max(room["ymax"], f0[3])
-            obstacles = placed_blks + list(pending.values())
-            dx = dy = 0.0
+    # 3) floor furniture -- local 2D re-place with full collision
+    placed_blks = [(q, f"static:{si}")
+                   for si, q in enumerate(ctx["static_blks"])]
+    for b in bays:                      # members at their FINAL deltas
+        for mi, p in enumerate(b["members"]):
+            placed_blks.append((_blk_shift(b["blks"][mi], *delta[p]), p))
+    pending = {p: (q, p) for p, q in ctx["orig_blks"].items()}
+    for o in ctx["floor_movers"]:
+        p = o["path"]
+        room = by_room[o["room"]]
+        del pending[p]
+        f0, z0, z1 = ctx["orig_blks"][p]
+        rxlo, rxhi = min(room["xmin"], f0[0]), max(room["xmax"], f0[2])
+        rylo, ryhi = min(room["ymin"], f0[1]), max(room["ymax"], f0[3])
+        gf = ctx["floor_gf"][p]
+        obstacles = [(q, tag) for q, tag in
+                     placed_blks + list(pending.values())
+                     if tag not in gf]
+
+        def _floor_ok(cdx, cdy, full_walls=False):
+            foot = _rect_shift(f0, cdx, cdy)
+            if foot[0] < rxlo or foot[2] > rxhi or \
+               foot[1] < rylo or foot[3] > ryhi:
+                return False
+            if any(_blk_hit((foot, z0, z1), q, margin=0.03)
+                   for q, _tag in obstacles):
+                return False
+            if full_walls:
+                # long-range move: the precomputed near-list only covers walls
+                # around the ORIGINAL spot -- check every wall mesh instead
+                ex = ctx["floor_wall_exempt"][p]
+                cand = (foot, z0, z1)
+                if any(_blk_hit(cand, w) for i, w in enumerate(ctx["wb_blks"])
+                       if i not in ex):
+                    return False
+            elif any(_rect_overlap(foot, w[0]) for w in ctx["floor_walls"][p]):
+                return False
+            return True
+
+        cx0 = 0.5 * (o["aabb"][0][0] + o["aabb"][1][0])
+        cy0 = 0.5 * (o["aabb"][0][1] + o["aabb"][1][1])
+        hx = 0.5 * (o["aabb"][1][0] - o["aabb"][0][0])
+        hy = 0.5 * (o["aabb"][1][1] - o["aabb"][0][1])
+        dx = dy = 0.0
+        if proposal_mode:
+            prop = params.get("floor", {}).get(p)
+            if prop is not None:
+                cdx, cdy = float(prop[0]) - cx0, float(prop[1]) - cy0
+                if _floor_ok(cdx, cdy, full_walls=True):
+                    dx, dy = cdx, cdy
+                else:
+                    rejected.append(f"floor[{o['class']}]=({prop[0]:.2f},{prop[1]:.2f})")
+        else:
             for _ in range(attempts):
-                cdx = rng.uniform(-max_shift, max_shift)
-                cdy = rng.uniform(-max_shift, max_shift)
-                foot = _rect_shift(f0, cdx, cdy)
-                if foot[0] < rxlo or foot[2] > rxhi or \
-                   foot[1] < rylo or foot[3] > ryhi:
-                    continue
-                cb = (foot, z0, z1)
-                if any(_blk_hit(cb, q, margin=0.03) for q in obstacles):
-                    continue
-                if any(_rect_overlap(foot, w[0]) for w in floor_walls[p]):
-                    continue
-                dx, dy = cdx, cdy
-                break
-            placed_blks.append((_rect_shift(f0, dx, dy), z0, z1))
-            delta[p] = (dx, dy)
-
-        # 4) surface items -- ride the support + re-scatter on its top
-        for sup_path, items in riders_of.items():
-            sup = obj_by_path[sup_path]
-            sdx, sdy = delta.get(sup_path, (0.0, 0.0))
-            (smn, smx) = sup["aabb"]
-            inset = 0.15 if sup["class"] in BED_CLASSES else 0.02
-            placed_r = []
-            # not-yet-placed riders block at their ORIGINAL spots, so a rider
-            # falling back to its original never collides with a later one
-            pending_r = {o["path"]: _foot(o["aabb"]) for o in items}
-            for o in items:
-                p = o["path"]
-                del pending_r[p]
-                hx = 0.5 * (o["aabb"][1][0] - o["aabb"][0][0])
-                hy = 0.5 * (o["aabb"][1][1] - o["aabb"][0][1])
-                ccx = 0.5 * (o["aabb"][0][0] + o["aabb"][1][0])
-                ccy = 0.5 * (o["aabb"][0][1] + o["aabb"][1][1])
-                x0, x1 = smn[0] + hx + inset, smx[0] - hx - inset
-                y0, y1 = smn[1] + hy + inset, smx[1] - hy - inset
-                ncx, ncy = ccx, ccy
-                if x1 > x0 and y1 > y0:
-                    for _ in range(20):
-                        tx, ty = rng.uniform(x0, x1), rng.uniform(y0, y1)
-                        rect = [tx - hx, ty - hy, tx + hx, ty + hy]
-                        if any(_rect_overlap(rect, q, margin=0.01)
-                               for q in placed_r + list(pending_r.values())):
-                            continue
-                        ncx, ncy = tx, ty
+                if ctx["global_frac"] > 0.0 and rng.random() < ctx["global_frac"]:
+                    # GLOBAL re-place: anywhere in the room (collision-checked)
+                    tx = rng.uniform(rxlo + hx, rxhi - hx)
+                    ty = rng.uniform(rylo + hy, ryhi - hy)
+                    cdx, cdy = tx - cx0, ty - cy0
+                    if _floor_ok(cdx, cdy, full_walls=True):
+                        dx, dy = cdx, cdy
                         break
-                placed_r.append([ncx - hx, ncy - hy, ncx + hx, ncy + hy])
-                delta[p] = (ncx - ccx + sdx, ncy - ccy + sdy)
+                else:
+                    cdx = rng.uniform(-max_shift, max_shift)
+                    cdy = rng.uniform(-max_shift, max_shift)
+                    if _floor_ok(cdx, cdy):
+                        dx, dy = cdx, cdy
+                        break
+        placed_blks.append(((_rect_shift(f0, dx, dy), z0, z1), p))
+        delta[p] = (dx, dy)
 
-        # 5) emit this frame's world translates
-        for o in objs:
-            ox, oy, oz = pos0[o["path"]]
-            dx, dy = delta.get(o["path"], (0.0, 0.0))
-            out[o["path"]].append((ox + dx, oy + dy, oz))
+    # 4) surface items -- ride the support + re-scatter on its top
+    for sup_path, items in ctx["riders_of"].items():
+        sup = obj_by_path[sup_path]
+        sdx, sdy = delta.get(sup_path, (0.0, 0.0))
+        (smn, smx) = sup["aabb"]
+        inset = 0.15 if sup["class"] in BED_CLASSES else 0.02
+        placed_r = []
+        # not-yet-placed riders block at their ORIGINAL spots, so a rider
+        # falling back to its original never collides with a later one
+        pending_r = {o["path"]: _foot(o["aabb"]) for o in items}
+        for o in items:
+            p = o["path"]
+            del pending_r[p]
+            hx = 0.5 * (o["aabb"][1][0] - o["aabb"][0][0])
+            hy = 0.5 * (o["aabb"][1][1] - o["aabb"][0][1])
+            ccx = 0.5 * (o["aabb"][0][0] + o["aabb"][1][0])
+            ccy = 0.5 * (o["aabb"][0][1] + o["aabb"][1][1])
+            x0, x1 = smn[0] + hx + inset, smx[0] - hx - inset
+            y0, y1 = smn[1] + hy + inset, smx[1] - hy - inset
+            ncx, ncy = ccx, ccy
+            if x1 > x0 and y1 > y0:
+                for _ in range(20):
+                    tx, ty = rng.uniform(x0, x1), rng.uniform(y0, y1)
+                    rect = [tx - hx, ty - hy, tx + hx, ty + hy]
+                    if any(_rect_overlap(rect, q, margin=0.01)
+                           for q in placed_r + list(pending_r.values())):
+                        continue
+                    ncx, ncy = tx, ty
+                    break
+            placed_r.append([ncx - hx, ncy - hy, ncx + hx, ncy + hy])
+            delta[p] = (ncx - ccx + sdx, ncy - ccy + sdy)
 
+    # 5) emit world translates
+    out = {}
+    for o in ctx["objs"]:
+        ox, oy, oz = ctx["pos0"][o["path"]]
+        dx, dy = delta.get(o["path"], (0.0, 0.0))
+        out[o["path"]] = (ox + dx, oy + dy, oz)
+    return out, rejected
+
+
+# -------------------------------------------------------------- public API --
+def generate(object_targets, rooms, floor_z, n_frames, seed=1000,
+             max_shift=0.8, wall_slide=0.2, sat_slide=0.5, attempts=40,
+             wall_boxes=None, door_clearance=0.5, link_gap=0.25,
+             global_frac=0.35, verbose=True):
+    """-> {path: [(x, y, z)] * n_frames}, every degree of freedom rng-sampled.
+    global_frac: probability that a floor item is re-placed ANYWHERE in its
+    room (collision-checked) instead of jittered near its original spot."""
+    rng = random.Random(seed)
+    ctx = _build_ctx(object_targets, rooms, floor_z, max_shift=max_shift,
+                     wall_slide=wall_slide, sat_slide=sat_slide,
+                     wall_boxes=wall_boxes, door_clearance=door_clearance,
+                     link_gap=link_gap, global_frac=global_frac,
+                     verbose=verbose)
+    out = {o["path"]: [] for o in ctx["objs"]}
+    for _f in range(n_frames):
+        pos, _ = _solve(ctx, rng, attempts=attempts)
+        for p, xyz in pos.items():
+            out[p].append(xyz)
     return out
+
+
+def apply_layout(ctx, params, seed=0):
+    """Validate ONE proposed layout (e.g. from an LLM layout designer) through
+    the exact same constraint machinery. Unproposed degrees of freedom stay at
+    the ORIGINAL pose; rider scatter uses `seed`. -> (positions, rejected)."""
+    rng = random.Random(seed)
+    return _solve(ctx, rng, params=params or {})
+
+
+def build_ctx(object_targets, rooms, floor_z, **kw):
+    """Public wrapper so layout designers (llm_placement.py) can build the
+    scene context once and call apply_layout() per proposal."""
+    return _build_ctx(object_targets, rooms, floor_z, **kw)
