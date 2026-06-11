@@ -306,10 +306,12 @@ SEMANTIC_RULES = [
     (re.compile(r".*\bward_?door.*",          re.I), "door"),
     (re.compile(r".*\btoilet_?door.*",        re.I), "door"),
     (re.compile(r".*\bfrontroom_?door.*",     re.I), "door"),
-    (re.compile(r".*\btoilet_?handle.*",      re.I), "toilet_handle"),
+    (re.compile(r".*\btoilet_?handle.*",      re.I), "door_handle"),  # door levers (real
+    # taxonomy: toilet_handle = the grab bars by the toilet, absent in sim)
     (re.compile(r".*\bhandle\d*$",            re.I), "door_handle"),
     (re.compile(r"^toilet(\b|_)",             re.I), "toilet"),
     (re.compile(r"^shower",                   re.I), "shower"),
+    (re.compile(r".*sink_?mirror.*",          re.I), "mirror"),  # mirror panel, NOT a sink
     (re.compile(r"^sink(\b|_|\d)",            re.I), "sink"),
     (re.compile(r".*\bmirror.*",              re.I), "mirror"),
     (re.compile(r".*\blight_?switch.*",       re.I), "light_switch"),
@@ -320,7 +322,6 @@ SEMANTIC_RULES = [
     (re.compile(r".*\bsoiled_?linen.*",       re.I), "soiled_linen_bin"),
     (re.compile(r".*\bsolid_?linen.*",        re.I), "soiled_linen_bin"),  # typo
     (re.compile(r".*\btrash_?can.*",          re.I), "waste_bin"),
-    (re.compile(r"^bucket(\b|_|\d)",          re.I), "waste_bin"),
     (re.compile(r".*\bsanitizer.*",           re.I), "sanitizer"),
     (re.compile(r".*\balcohol_?spray.*",      re.I), "alcohol_spray_bottle"),
     (re.compile(r".*\btelephone.*",           re.I), "telephone"),
@@ -337,7 +338,6 @@ SEMANTIC_RULES = [
     (re.compile(r".*\bblood_?pressure.*",     re.I), "bedside_monitor"),
     (re.compile(r".*\bTV\b.*",                re.I), "TV"),
     (re.compile(r".*\bwindow\b.*",            re.I), "window"),
-    (re.compile(r".*\baccess_?sensor.*",      re.I), "door_handle"),
     (re.compile(r".*\btissue.*",              re.I), "tissue_dispenser"),
 ]
 
