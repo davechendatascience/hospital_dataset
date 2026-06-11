@@ -48,7 +48,13 @@ def collect_images(dirs, include_real_dev=True):
     for d in dirs:
         d = Path(d)
         if d.is_dir():
-            paths += [p for p in sorted(d.iterdir()) if p.suffix.lower() in IMG_EXT]
+            # raw replicator dirs hold label/channel PNGs next to the RGB --
+            # keep only actual camera images in the SSL corpus
+            skip = ("semantic_", "instance_", "distance_", "normals_",
+                    "bounding_")
+            paths += [p for p in sorted(d.iterdir())
+                      if p.suffix.lower() in IMG_EXT
+                      and not p.name.startswith(skip)]
     if include_real_dev:
         real = PROJECT / "ward_v3/test/images"
         if real.is_dir():
