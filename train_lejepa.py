@@ -224,6 +224,12 @@ def main():
               f"loss={agg['loss']/n:.4f} pred={agg['pred']/n:.4f} "
               f"sigreg={agg['sig']/n:.5f} std={agg['std']/n:.3f} "
               f"({time.time()-t0:.0f}s)", flush=True)
+        # rolling per-epoch checkpoint (atomic rename so a concurrent reader
+        # -- e.g. train_seg_detr --backbone lejepa -- never sees a partial file)
+        tmp = out / "ckpt_last.pt.tmp"
+        torch.save({"arch": args.arch, "dim": dim, "epoch": ep,
+                    "model": net.state_dict()}, tmp)
+        tmp.replace(out / "ckpt_last.pt")
         if ep % args.ckpt_every == 0 or ep == args.epochs:
             torch.save({"arch": args.arch, "dim": dim, "epoch": ep,
                         "model": net.state_dict()}, out / f"ckpt_ep{ep}.pt")
