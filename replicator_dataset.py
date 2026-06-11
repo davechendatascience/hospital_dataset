@@ -959,12 +959,16 @@ if args.save_layout_png and wall_mask is not None:
     save_layout_png(rooms, wall_mask, plan_xmin, plan_ymin, grid_size,
                     object_targets, layout_path)
 
-def sample_camera_pose(rng):
+def sample_camera_pose(rng, centroid_of=None, extra_no_go=None):
     """Pick a room (weighted by labeled-object count), sample a camera
     position inside that room's XY AABB at eye level, aim at one of the
     room's member objects. Room assignment is by prim-name pattern so the
     camera is guaranteed to be in the same room as its target, even though
-    the USD walls don't form a closed geometric partition."""
+    the USD walls don't form a closed geometric partition.
+
+    centroid_of: optional {path: (x,y,z)} of MOVED centroids for this frame
+    (placement DR) so the camera aims at where the object actually is.
+    extra_no_go: optional moved AABBs to reject camera positions inside."""
     rooms_with_members = [r for r in rooms if r["members"]]
     if not rooms_with_members:
         mx_ = 0.3
@@ -981,6 +985,8 @@ def sample_camera_pose(rng):
     room = rng.choices(rooms_with_members, weights=weights, k=1)[0]
     target_obj = rng.choice(room["members"])
     target = target_obj["centroid"]
+    if centroid_of:
+        target = centroid_of.get(target_obj["path"], target)
 
     # Rejection-sample the camera position: far enough from the target AND
     # not inside a wall mesh or any labeled object's AABB (a camera inside
@@ -997,6 +1003,9 @@ def sample_camera_pose(rng):
             pos = cand
             continue
         if _inside_any_wall(cand) or _inside_any_object(cand, no_go_aabbs):
+            pos = cand
+            continue
+        if extra_no_go and _inside_any_object(cand, extra_no_go):
             pos = cand
             continue
         if _line_of_sight_blocked(cand, target):
@@ -1060,8 +1069,64 @@ def sample_camera_trajectory(rng, n_frames, n_keys):
     return _catmull_rom(key_pos, n_frames), _catmull_rom(key_look, n_frames)
 
 
+# ---- Meaningful placement DR (v2): hierarchical room -> bed bay / wall groups /
+# floor furniture / surface items (placement_dr.py). Computed BEFORE camera
+# sampling so each frame's camera aims at the MOVED scene, not stale centroids.
+PLACEMENT_SEQ = {}
+_ot_by_path = {}
+if args.randomize_placement:
+    import placement_dr
+    _pseed = args.placement_seed or args.seed
+    for _ot in object_targets:
+        _prim = stage.GetPrimAtPath(_ot["path"])
+        _M = UsdGeom.Xformable(_prim).ComputeLocalToWorldTransform(
+            Usd.TimeCode.Default())
+        _t = _M.ExtractTranslation()
+        _ot["translate"] = (float(_t[0]), float(_t[1]), float(_t[2]))
+        _ot["room"] = assign_room(_ot["path"].rsplit("/", 1)[-1])
+    _dump = {
+        "objects": [{k: _ot[k] for k in
+                     ("path", "class", "centroid", "aabb", "size",
+                      "translate", "room")} for _ot in object_targets],
+        "rooms": [{k: r[k] for k in ("name", "xmin", "xmax", "ymin", "ymax")}
+                  for r in rooms],
+        "floor_z": floor_z,
+        "wall_aabbs": wall_aabbs,
+    }
+    Path(args.out).mkdir(parents=True, exist_ok=True)
+    (Path(args.out) / "_placement_inputs.json").write_text(json.dumps(_dump))
+    _seq_all = placement_dr.generate(
+        object_targets, rooms, floor_z, n_frames=args.frames,
+        seed=_pseed, max_shift=args.placement_shift, wall_boxes=wall_aabbs)
+    PLACEMENT_SEQ = {p: s for p, s in _seq_all.items() if len(set(s)) > 1}
+    _ot_by_path = {o["path"]: o for o in object_targets}
+    print(f"[placement-dr] {len(PLACEMENT_SEQ)}/{len(_seq_all)} objects move "
+          f"across {args.frames} frames (max_shift={args.placement_shift} m, "
+          f"seed={_pseed})", flush=True)
+
+
+def _moved_view(_f):
+    """Per-frame camera aim data under placement DR: {path: moved centroid}
+    + the moved AABBs (extra camera no-go volumes for this frame)."""
+    _cof, _xng = {}, []
+    for _p, _s in PLACEMENT_SEQ.items():
+        _o = _ot_by_path[_p]
+        _ox, _oy, _oz = _o["translate"]
+        _dx, _dy, _dz = (_s[_f][0] - _ox, _s[_f][1] - _oy, _s[_f][2] - _oz)
+        _c = _o["centroid"]
+        _cof[_p] = (_c[0] + _dx, _c[1] + _dy, _c[2] + _dz)
+        (_amn, _amx) = _o["aabb"]
+        _xng.append(((_amn[0] + _dx, _amn[1] + _dy, _amn[2] + _dz),
+                     (_amx[0] + _dx, _amx[1] + _dy, _amx[2] + _dz)))
+    return _cof, _xng
+
+
 rng = random.Random(args.seed)
 if args.trajectory or args.cosmos:
+    if PLACEMENT_SEQ:
+        print("[placement-dr] NOTE: trajectory/cosmos mode renders a coherent "
+              "clip but placement changes the scene EVERY frame; consider "
+              "omitting --randomize-placement for clips.", flush=True)
     # Smooth fly-through -> temporally-coherent clip for Cosmos-Transfer (video).
     camera_positions, camera_targets = sample_camera_trajectory(
         rng, args.frames, args.traj_keys)
@@ -1069,8 +1134,14 @@ else:
     camera_positions = []
     camera_targets   = []
     _n_fallback = 0
-    for _ in range(args.frames):
-        p, t, ok = sample_camera_pose(rng)
+    for _f in range(args.frames):
+        if PLACEMENT_SEQ:
+            # aim at the MOVED scene of this frame, avoid the moved volumes
+            _cof, _xng = _moved_view(_f)
+            p, t, ok = sample_camera_pose(rng, centroid_of=_cof,
+                                          extra_no_go=_xng)
+        else:
+            p, t, ok = sample_camera_pose(rng)
         camera_positions.append(p)
         camera_targets.append(t)
         if not ok:
@@ -1203,25 +1274,6 @@ if MATERIAL_DR:
     if not (tex_scale_paths or color_ranges or mdl_tint_paths):
         print("[material-dr] no perturbable shaders found -> disabling material DR")
         MATERIAL_DR = False
-
-# ---- Meaningful placement DR: precompute per-object per-frame world translate ----
-PLACEMENT_SEQ = {}
-if args.randomize_placement:
-    import placement_dr
-    _pseed = args.placement_seed or args.seed
-    for _ot in object_targets:
-        _prim = stage.GetPrimAtPath(_ot["path"])
-        _M = UsdGeom.Xformable(_prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-        _t = _M.ExtractTranslation()
-        _ot["translate"] = (float(_t[0]), float(_t[1]), float(_t[2]))
-        _ot["room"] = assign_room(_ot["path"].rsplit("/", 1)[-1])
-    PLACEMENT_SEQ = placement_dr.generate(
-        object_targets, rooms, floor_z, n_frames=args.frames,
-        seed=_pseed, max_shift=args.placement_shift)
-    _nmoved = sum(1 for v in PLACEMENT_SEQ.values() if len(set(v)) > 1)
-    print(f"[placement-dr] {len(PLACEMENT_SEQ)} objects over {args.frames} frames, "
-          f"max_shift={args.placement_shift} m, seed={_pseed} ({_nmoved} objects move)",
-          flush=True)
 
 # Per-frame randomization: camera pose + ceiling-light intensity/color temp
 with rep.trigger.on_frame(num_frames=args.frames, rt_subframes=args.rt_subframes):
