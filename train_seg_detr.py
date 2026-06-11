@@ -159,6 +159,65 @@ class Dinov2SimpleFPN(nn.Module):
         return SimpleNamespace(feature_maps=feature_maps)
 
 
+class LejepaResNetPyramid(nn.Module):
+    """A ResNet-50 pretrained with OUR in-domain LeJEPA (train_lejepa.py) as the
+    Mask2Former backbone. ResNets are natively pyramidal -- layer1..layer4 give
+    strides 4/8/16/32 -- so each level is just projected to a common width H
+    for the pixel decoder. With freeze=True the ResNet (incl. BatchNorm running
+    stats) is frozen in eval mode: the test is whether features pretrained
+    jointly on sim+styled+real survive the sim->real shift better than generic
+    pretrained backbones. Same contract as Dinov2SimpleFPN."""
+
+    def __init__(self, ckpt_path: str, H: int = 768, freeze: bool = True):
+        super().__init__()
+        from torchvision.models import resnet50
+
+        net = resnet50(weights=None)
+        net.fc = nn.Identity()
+        ck = torch.load(ckpt_path, map_location="cpu")
+        missing, unexpected = net.load_state_dict(ck["model"], strict=False)
+        assert not unexpected, f"unexpected keys in lejepa ckpt: {unexpected[:5]}"
+        self.ckpt_epoch = ck.get("epoch", "?")
+        # `res` prefix is load-bearing: the optimizer's _is_backbone() matcher
+        # uses it to separate frozen backbone params from the new projections
+        self.res = nn.Sequential()
+        self.res.stem = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool)
+        self.res.layer1, self.res.layer2 = net.layer1, net.layer2
+        self.res.layer3, self.res.layer4 = net.layer3, net.layer4
+        self.freeze = freeze
+        if freeze:
+            for p in self.res.parameters():
+                p.requires_grad_(False)
+            self.res.eval()
+
+        def head(c_in: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Conv2d(c_in, H, 1, bias=False), _group_norm(H),
+                nn.Conv2d(H, H, 3, padding=1, bias=False), _group_norm(H),
+            )
+
+        self.out4, self.out8 = head(256), head(512)
+        self.out16, self.out32 = head(1024), head(2048)
+        self.channels = [H, H, H, H]
+
+    def train(self, mode: bool = True) -> "LejepaResNetPyramid":
+        super().train(mode)
+        if self.freeze:   # keep frozen BN running stats / deterministic feats
+            self.res.eval()
+        return self
+
+    def forward(self, pixel_values: torch.Tensor, **kwargs) -> SimpleNamespace:
+        ctx = torch.no_grad() if self.freeze else torch.enable_grad()
+        with ctx:
+            x = self.res.stem(pixel_values)
+            c2 = self.res.layer1(x)
+            c3 = self.res.layer2(c2)
+            c4 = self.res.layer3(c3)
+            c5 = self.res.layer4(c4)
+        return SimpleNamespace(feature_maps=(
+            self.out4(c2), self.out8(c3), self.out16(c4), self.out32(c5)))
+
+
 class GistFirstNetwork(nn.Module):
     """Global-first ("reverse hierarchy") backbone. See
     docs/global-first-architecture.md.
@@ -318,6 +377,19 @@ def _build_m2f_shell(args, H: int):
     return model, copied
 
 
+def build_lejepa_mask2former(args) -> "nn.Module":
+    """Mask2Former with a frozen in-domain LeJEPA ResNet-50 backbone."""
+    H = 768
+    model, copied = _build_m2f_shell(args, H)
+    enc = LejepaResNetPyramid(str(args.lejepa_ckpt), H=H,
+                              freeze=args.freeze_backbone)
+    model.model.pixel_level_module.encoder = enc
+    print(f"[seg-detr] lejepa backbone {args.lejepa_ckpt} "
+          f"(ssl epoch {enc.ckpt_epoch}, H={H}, freeze={args.freeze_backbone}); "
+          f"decoder warm-started ({copied} tensors) from {args.model}")
+    return model
+
+
 def build_dinov2_mask2former(args) -> "nn.Module":
     """Mask2Former with a frozen DINOv2 + Simple Feature Pyramid backbone."""
     from transformers import AutoConfig
@@ -361,13 +433,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", default="facebook/mask2former-swin-tiny-coco-instance",
                    help="HF model id (Mask2Former / MaskFormer instance-seg checkpoint). "
                         "For --backbone dinov2 this is the decoder warm-start source.")
-    p.add_argument("--backbone", choices=["swin", "dinov2", "gfn"], default="swin",
+    p.add_argument("--backbone", choices=["swin", "dinov2", "gfn", "lejepa"],
+                   default="swin",
                    help="swin = COCO Mask2Former (backbone frozen by default; "
                         "--no-freeze-backbone to fully fine-tune). "
                         "dinov2 = frozen DINOv2 ViT + Simple Feature Pyramid. "
                         "gfn = Gist-First Network (global-first: gist from frozen "
                         "DINOv2 gates a top-down pyramid). All warm-start the "
                         "decoder from --model.")
+    p.add_argument("--lejepa-ckpt", type=Path, default=None,
+                   help="(lejepa) checkpoint from train_lejepa.py; default: the "
+                        "newest lejepa_runs/*/ckpt_*.pt.")
     p.add_argument("--dino-name", default="facebook/dinov2-base",
                    help="(dinov2) HF DINOv2 id, e.g. facebook/dinov2-base, "
                         "facebook/dinov2-large, facebook/dinov2-with-registers-base.")
@@ -691,6 +767,15 @@ def main() -> None:
         processor.size_divisor = 14
         model = (build_gfn_mask2former(args) if args.backbone == "gfn"
                  else build_dinov2_mask2former(args))
+    elif args.backbone == "lejepa":
+        if args.lejepa_ckpt is None:
+            cands = sorted(PROJECT_ROOT.glob("lejepa_runs/*/ckpt_*.pt"),
+                           key=lambda p: p.stat().st_mtime)
+            if not cands:
+                raise SystemExit("--backbone lejepa: no lejepa_runs/*/ckpt_*.pt "
+                                 "found; pass --lejepa-ckpt")
+            args.lejepa_ckpt = cands[-1]
+        model = build_lejepa_mask2former(args)
     else:
         from transformers import AutoModelForUniversalSegmentation
         model = AutoModelForUniversalSegmentation.from_pretrained(
@@ -751,6 +836,8 @@ def main() -> None:
     def _is_backbone(name: str) -> bool:
         if args.backbone in ("dinov2", "gfn"):
             return "pixel_level_module.encoder.dino" in name
+        if args.backbone == "lejepa":
+            return "pixel_level_module.encoder.res" in name
         return "pixel_level_module.encoder" in name
 
     backbone_params, head_params = [], []
