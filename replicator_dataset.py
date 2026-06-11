@@ -1107,7 +1107,7 @@ if args.randomize_placement:
     _ot_by_path = {o["path"]: o for o in object_targets}
     print(f"[placement-dr] {len(PLACEMENT_SEQ)}/{len(_seq_all)} objects move "
           f"across {args.frames} frames (max_shift={args.placement_shift} m, "
-          f"seed={_pseed})", flush=True)
+          f"global_frac={args.placement_global_frac}, seed={_pseed})", flush=True)
 
 
 def _moved_view(_f):
