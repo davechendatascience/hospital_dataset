@@ -27,7 +27,7 @@ ROS2_bridge/
 __pycache__/
 *.pyc
 *.pyo
-.venv/
+.venv
 .ipynb_checkpoints/
 
 # Cosmos job configs + seg maps (regenerable, reference local paths)
@@ -37,3 +37,7 @@ llm_layouts*/
 ward_v4/
 lejepa_runs/
 ward_v4_gt/
+_recovery_replicator.py
+.venv
+Ward_dataset0518/
+ward_data/

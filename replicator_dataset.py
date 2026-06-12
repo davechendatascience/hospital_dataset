@@ -15,8 +15,9 @@ The goal of this script is to fix the sim->real composition gap by:
   - randomizing ceiling lighting per frame (temperature + intensity)
   - muting the per-asset DomeLights and the `Grey_Studio` DistantLight that
     produce the synthetic "studio render" look
-  - auto-labeling prims via name -> fixed_categories.FIXED_CATEGORIES (mirrors
-    your ROS2 chain) so the existing COCO post-processor still applies
+  - trusting the semantics AUTHORED in the stage (Semantic Schema Editor);
+    labels are only normalized onto fixed_categories.FIXED_CATEGORIES at COCO
+    conversion (case fixes + LABEL_ALIASES), never rewritten on prims
   - writing in the same `rgbDataset/<tag>_rgb/` + `jsonDataset/<tag>.json` layout
     expected by ROS2_bridge/src/from_ward_to_roboflow_dataset.py
 """
@@ -138,7 +139,8 @@ from pxr import Usd, UsdGeom, UsdLux, Sdf, Gf         # noqa: E402
 
 # Load your taxonomy so the same class names are used everywhere.
 sys.path.insert(0, str(PROJECT_ROOT / "ROS2_bridge" / "src"))
-from fixed_categories import FIXED_CATEGORIES        # noqa: E402
+from fixed_categories import (                        # noqa: E402
+    FIXED_CATEGORIES, normalize_label, class_from_entry)
 
 random.seed(args.seed)
 np.random.seed(args.seed)
@@ -146,6 +148,10 @@ np.random.seed(args.seed)
 # ============================================================================
 # Step 1 — open stage
 # ============================================================================
+# Relative stage paths make omni.usd double-anchor relative payload refs
+# (Collected_Ward0505/Collected_Ward0505/...) -> assets silently fail to load
+# and every object renders empty/unlabeled. Always open by absolute path.
+args.stage = str(Path(args.stage).resolve())
 print(f"[boot] opening stage: {args.stage}")
 ctx = omni.usd.get_context()
 ok = ctx.open_stage(args.stage)
@@ -275,100 +281,94 @@ print(f"[room] size=({bmax[0]-bmin[0]:.2f}, {bmax[1]-bmin[1]:.2f}, "
 
 
 # ============================================================================
-# Step 4 — auto-attach semantic labels by prim-name regex match
-# We compile a list of (regex, class_name) rules from FIXED_CATEGORIES. Some
-# names need synonyms (your prim is "hospitalbed", category is "hospital_bed").
+# Step 4 — collect the semantics AUTHORED in the stage. The ward USD carries
+# hand-set labels (Semantic Schema Editor, new UsdSemantics
+# `semantics:labels:*` API) on ~100 prims, including NESTED ones (cabinet
+# doors, toilet grab bars). Those are the single source of truth: nothing is
+# written here, Replicator reads them natively. We only gather camera /
+# placement targets from the labeled TOP-LEVEL prims and report anything
+# that doesn't normalize into fixed_categories.py.
 # ============================================================================
 import re                                              # noqa: E402
 
-# (prim_name_pattern, category_key_in_FIXED_CATEGORIES)
-# Patterns are case-insensitive, matched against the prim's `getName()` ONLY
-# (not the full path), and the first match wins.
-SEMANTIC_RULES = [
-    (re.compile(r".*\bhospitalbed.*",         re.I), "hospital_bed"),
-    (re.compile(r".*\bbedsidetable.*",        re.I), "bedside_table"),
-    (re.compile(r".*\boverbedtable.*",        re.I), "overbed_table"),
-    (re.compile(r".*\bovedbedtable.*",        re.I), "overbed_table"),  # typo
-    (re.compile(r".*\bbedside_?monitor.*",    re.I), "bedside_monitor"),
-    (re.compile(r".*\bmonitor_?model.*",      re.I), "bedside_monitor"),
-    (re.compile(r".*\biv[_-]?pole.*",         re.I), "iv_pole"),
-    (re.compile(r".*\boxygen_?flowmeter.*",   re.I), "oxygen_flowmeter"),
-    (re.compile(r".*\bgas_?medical_?wall.*",  re.I), "gas_manifold"),
-    (re.compile(r".*\bsuction_?jar.*",        re.I), "suction_jar"),
-    (re.compile(r".*\bsuction_?knob.*",       re.I), "suction_knob"),
-    (re.compile(r"^suction(_.*)?$",           re.I), "suction_jar"),
-    (re.compile(r".*\bcompanion_?chair.*",    re.I), "companion_chair"),
-    (re.compile(r".*\bguest_?chair.*",        re.I), "companion_chair"),
-    (re.compile(r".*\bstool.*",               re.I), "stool"),
-    (re.compile(r".*\bbed_?curtain.*",        re.I), "bed_curtain"),
-    (re.compile(r".*\bwindow_?curtain.*",     re.I), "curtain"),
-    (re.compile(r"^curtain.*",                re.I), "curtain"),
-    (re.compile(r".*\bward_?door.*",          re.I), "door"),
-    (re.compile(r".*\btoilet_?door.*",        re.I), "door"),
-    (re.compile(r".*\bfrontroom_?door.*",     re.I), "door"),
-    (re.compile(r".*\btoilet_?handle.*",      re.I), "door_handle"),  # door levers (real
-    # taxonomy: toilet_handle = the grab bars by the toilet, absent in sim)
-    (re.compile(r".*\bhandle\d*$",            re.I), "door_handle"),
-    (re.compile(r"^toilet(\b|_)",             re.I), "toilet"),
-    (re.compile(r"^shower",                   re.I), "shower"),
-    (re.compile(r".*sink_?mirror.*",          re.I), "mirror"),  # mirror panel, NOT a sink
-    (re.compile(r"^sink(\b|_|\d)",            re.I), "sink"),
-    (re.compile(r".*\bmirror.*",              re.I), "mirror"),
-    (re.compile(r".*\blight_?switch.*",       re.I), "light_switch"),
-    (re.compile(r".*\blightswitcher.*",       re.I), "light_switch"),
-    (re.compile(r".*\bair_?vent.*",           re.I), "air_vent"),
-    (re.compile(r".*\bhook\d*$",              re.I), "hook"),
-    (re.compile(r".*\bmedical_?waste.*",      re.I), "medical_waste_container"),
-    (re.compile(r".*\bsoiled_?linen.*",       re.I), "soiled_linen_bin"),
-    (re.compile(r".*\bsolid_?linen.*",        re.I), "soiled_linen_bin"),  # typo
-    (re.compile(r".*\btrash_?can.*",          re.I), "waste_bin"),
-    (re.compile(r".*\bsanitizer.*",           re.I), "sanitizer"),
-    (re.compile(r".*\balcohol_?spray.*",      re.I), "alcohol_spray_bottle"),
-    (re.compile(r".*\btelephone.*",           re.I), "telephone"),
-    (re.compile(r".*\bremote_?control.*",     re.I), "remote_control"),
-    (re.compile(r".*\bstethoscope.*",         re.I), "stethoscope"),
-    (re.compile(r".*\bear_?thermometer.*",    re.I), "ear_thermometer"),
-    (re.compile(r".*\bgauze.*",               re.I), "gauze"),
-    (re.compile(r".*\bglove.*",               re.I), "medical_gloves"),
-    (re.compile(r".*\bsyringe.*",             re.I), "syringe"),
-    (re.compile(r".*\bmedical_?package.*",    re.I), "medical_package"),
-    (re.compile(r".*\bpaperbox.*",            re.I), "paperbox"),
-    (re.compile(r".*\bweight_?scale.*",       re.I), "weight_scale"),
-    (re.compile(r"^scale\d*$",                re.I), "weight_scale"),
-    (re.compile(r".*\bblood_?pressure.*",     re.I), "bedside_monitor"),
-    (re.compile(r".*\bTV\b.*",                re.I), "TV"),
-    (re.compile(r".*\bwindow\b.*",            re.I), "window"),
-    (re.compile(r".*\btissue.*",              re.I), "tissue_dispenser"),
-]
+
+def authored_labels(prim) -> list[str]:
+    """All semantic labels authored on this prim (new + legacy API)."""
+    out = []
+    for attr in prim.GetAttributes():
+        n = attr.GetName()
+        if n.startswith("semantics:labels:"):
+            out += [str(v) for v in (attr.Get() or [])]
+        elif n.startswith("semantic:") and n.endswith(":params:semanticData"):
+            out += [t.strip() for t in str(attr.Get() or "").split(",")
+                    if t.strip()]
+    return out
 
 
-def apply_semantics(stage: Usd.Stage):
+def bridge_to_class_taxonomy(prim, labels) -> None:
+    """Mirror the authored label onto the legacy 'class' taxonomy IN-SESSION.
+
+    The Semantic Schema Editor wrote `semantics:labels:<instance>` with
+    per-object instance names ("Mirror", "handle1", ...) -- NOT the 'class'
+    taxonomy that Replicator's annotators filter on by default, so every
+    hand-set label is invisible to the writer. (Feeding all ~94 taxonomies
+    via BasicWriter(semantic_types=...) sets a giant global filter predicate
+    that crashes this build.) The label VALUE is copied verbatim; the stage
+    is never saved, so the authored labels stay the source of truth."""
+    from pxr import Semantics  # type: ignore
+    sem = Semantics.SemanticsAPI.Apply(prim, "Semantics")
+    sem.CreateSemanticTypeAttr().Set("class")
+    sem.CreateSemanticDataAttr().Set(",".join(labels))
+
+
+def collect_semantics(stage: Usd.Stage):
     counts = {}
-    unmatched_top = []
+    unmatched_top = []     # top prims with no authored label anywhere
+    nested_only = []       # top prims labeled only in their subtree
+    off_taxonomy = []      # (path, raw_label) that normalize_label can't map
     matched_paths = []     # for room-AABB / debugging
     object_targets = []    # list of dict(path, class, centroid, aabb, size)
     oversized = []         # rejected for MAX_OBJ_DIM filter
 
-    from pxr import Semantics  # type: ignore  # noqa: E402
     bcache = UsdGeom.BBoxCache(Usd.TimeCode.Default(),
                                [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
 
+    # Full sweep: bridge every authored label (including NESTED ones --
+    # cabinet doors, grab bars) onto the 'class' taxonomy the writer reads.
+    bridged = 0
+    for p in Usd.PrimRange(stage.GetPrimAtPath("/World"),
+                           Usd.TraverseInstanceProxies()):
+        labs = authored_labels(p)
+        if labs:
+            bridge_to_class_taxonomy(p, labs)
+            bridged += 1
+    print(f"[semantics] bridged {bridged} authored labels onto the 'class' "
+          f"taxonomy (in-session only; stage not saved)")
+
     for top in stage.GetPrimAtPath("/World").GetChildren():
-        name = top.GetName()
+        labels = authored_labels(top)
+        if not labels:
+            # No label on the top prim itself; nested labels (cabinet doors,
+            # grab bars, wardwall/window) still render + convert natively —
+            # they just aren't camera/placement targets.
+            for p in Usd.PrimRange(top, Usd.TraverseInstanceProxies()):
+                if p != top and authored_labels(p):
+                    nested_only.append(top.GetName())
+                    break
+            else:
+                unmatched_top.append(top.GetName())
+            continue
         match = None
-        for pattern, cls in SEMANTIC_RULES:
-            if pattern.search(name):
-                match = cls
+        for lab in labels:
+            match = normalize_label(lab)
+            if match is not None:
                 break
-        if match is None:
-            unmatched_top.append(name)
-            continue
-        if match not in FIXED_CATEGORIES:
-            print(f"  rule matched but '{match}' not in fixed_categories.py "
-                  f"(prim={name})")
-            continue
         path = str(top.GetPath())
-        # Compute world AABB BEFORE applying semantics so we can sanity-filter.
+        if match is None:
+            off_taxonomy.append((path, ",".join(labels)))
+            continue
+        # World AABB sanity-filter (contaminated assets would make terrible
+        # camera targets / placement members).
         try:
             box = bcache.ComputeWorldBound(top).ComputeAlignedBox()
             mn, mx = box.GetMin(), box.GetMax()
@@ -377,18 +377,11 @@ def apply_semantics(stage: Usd.Stage):
                 continue
             sx, sy, sz = float(mx[0] - mn[0]), float(mx[1] - mn[1]), float(mx[2] - mn[2])
             if max(sx, sy) > args.max_obj_dim:
-                # Likely a "contaminated" asset whose root encompasses the
-                # whole scene; do NOT label it (would generate huge spurious
-                # bboxes) and DO NOT use it as a camera target.
                 oversized.append((path, match, f"({sx:.1f} x {sy:.1f} x {sz:.1f}) m"))
                 continue
         except Exception as e:
             oversized.append((path, match, f"AABB failed: {e}"))
             continue
-        # OK — apply semantic and remember the prim
-        sem = Semantics.SemanticsAPI.Apply(top, "Semantics")
-        sem.CreateSemanticTypeAttr().Set("class")
-        sem.CreateSemanticDataAttr().Set(match)
         counts[match] = counts.get(match, 0) + 1
         matched_paths.append(path)
         centroid = (
@@ -405,11 +398,20 @@ def apply_semantics(stage: Usd.Stage):
             "size": (sx, sy, sz),
         })
 
+    if nested_only:
+        print(f"[semantics] {len(nested_only)} top prims labeled only in their "
+              f"subtree (rendered, not camera targets): "
+              f"{', '.join(sorted(nested_only))}")
+    if off_taxonomy:
+        print(f"[semantics] {len(off_taxonomy)} top prims with labels outside "
+              f"the taxonomy (rendered but DROPPED at COCO conversion):")
+        for path, raw in off_taxonomy:
+            print(f"     {raw:24s} {path}")
     return counts, unmatched_top, matched_paths, object_targets, oversized
 
 
-print("[semantics] applying class labels to top-level prims under /World")
-counts, unmatched, matched_paths, object_targets, oversized = apply_semantics(stage)
+print("[semantics] reading authored class labels from the stage (/World)")
+counts, unmatched, matched_paths, object_targets, oversized = collect_semantics(stage)
 for k, v in sorted(counts.items()):
     print(f"  {v:3d} x {k}")
 if unmatched:
@@ -1548,11 +1550,8 @@ def basic_writer_to_coco(raw_dir: Path, out_root: Path, tag: str,
             w, h = x_max - x_min, y_max - y_min
             if w <= 1 or h <= 1:
                 continue
-            entry = labels.get(str(sid))
-            if not entry:
-                continue
-            class_name = entry.get("class")
-            if class_name not in category_map:
+            class_name = class_from_entry(labels.get(str(sid)))
+            if class_name is None or class_name not in category_map:
                 continue
             coco["annotations"].append({
                 "id": ann_id,
@@ -1584,6 +1583,14 @@ else:
         tag=args.tag,
         category_map=FIXED_CATEGORIES,
     )
+    # GT overlays next to every raw frame (instance masks + class names) so
+    # label alignment can be eyeballed straight from the writer output.
+    try:
+        from overlay_raw_gt import generate as _gt_generate
+        print("[post] writing gt_<idx>.jpg overlays next to raw frames")
+        _gt_generate(Path(args.out) / "_raw")
+    except Exception as _e:
+        print(f"[post] GT overlay generation failed (non-fatal): {_e}")
     print(f"[done] dataset under {args.out}")
     print(f"      then run:  python -m src.from_ward_to_roboflow_dataset \\")
     print(f"                    --input-root {args.out}")

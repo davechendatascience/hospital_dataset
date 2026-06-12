@@ -23,6 +23,8 @@ PROJECT = Path(__file__).resolve().parent
 def render_split(split_dir: Path, out_dir: Path, n: int, seed: int) -> int:
     ann_file = split_dir / "_annotations.coco.json"
     img_dir = split_dir / "images"
+    if not img_dir.is_dir():
+        img_dir = split_dir          # build_dataset layout: images in split root
     if not ann_file.is_file() or not img_dir.is_dir():
         print(f"[gt] {split_dir}: missing images/ or annotations -- skipped")
         return 0

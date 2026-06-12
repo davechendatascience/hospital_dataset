@@ -536,6 +536,8 @@ class CocoInstanceSeg(Dataset):
 
     def __init__(self, split_dir: Path, max_samples: int = 0):
         self.images_dir = split_dir / "images"
+        if not self.images_dir.is_dir():
+            self.images_dir = split_dir   # images in split root (build_dataset)
         ann_path = split_dir / "_annotations.coco.json"
         if not ann_path.is_file():
             raise FileNotFoundError(f"missing {ann_path}")

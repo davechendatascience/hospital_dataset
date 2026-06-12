@@ -37,6 +37,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -45,7 +46,8 @@ from pycocotools import mask as coco_mask
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / "ROS2_bridge" / "src"))
-from fixed_categories import FIXED_CATEGORIES  # type: ignore  # noqa: E402
+from fixed_categories import (  # type: ignore  # noqa: E402
+    FIXED_CATEGORIES, class_from_entry)
 
 DEFAULT_STAGE          = PROJECT_ROOT / "Collected_Ward0505" / "Ward0505.usd"
 DEFAULT_REAL_TEST_ROOT = Path("/home/edge-host/Documents/Ward_dataset0518")
@@ -357,8 +359,11 @@ def _gpu_check_frame(rgb_path, inst_png, sem_map_path, prune_cfg,
             iid = int(k)
         except ValueError:
             continue
-        cls = (v or {}).get("class", "")
-        if cls in ("BACKGROUND", "UNLABELLED", "") or cls not in category_map:
+        raw = (v or {}).get("class", "")
+        if raw in ("BACKGROUND", "UNLABELLED", ""):
+            continue
+        cls = class_from_entry(v)
+        if cls is None or cls not in category_map:
             continue
         pairs.append((iid, cls))
 
@@ -511,11 +516,12 @@ def convert_raw_to_coco(raw_dir: Path, split_dir: Path,
                 inst_id = int(inst_id_str)
             except ValueError:
                 continue
-            class_name = (info or {}).get("class", "")
-            if class_name in ("BACKGROUND", "UNLABELLED", ""):
+            raw = (info or {}).get("class", "")
+            if raw in ("BACKGROUND", "UNLABELLED", ""):
                 skipped_ann["bg"] += 1
                 continue
-            if class_name not in category_map:
+            class_name = class_from_entry(info)
+            if class_name is None or class_name not in category_map:
                 skipped_ann["oor"] += 1
                 continue
             inst_pixels = (inst_map == inst_id)
@@ -813,6 +819,31 @@ def main() -> None:
     if not args.skip_test:
         build_test_from_real(args.real_test_root, args.out / "test",
                              FIXED_CATEGORIES)
+
+    # 3b) Post check: per-class annotation histogram per split + sampled GT
+    # overlays so label correctness can be eyeballed immediately.
+    id2name = {v: k for k, v in FIXED_CATEGORIES.items()}
+    for split in ("train", "valid", "test"):
+        ann_file = args.out / split / "_annotations.coco.json"
+        if not ann_file.is_file():
+            continue
+        coco = json.loads(ann_file.read_text())
+        hist = Counter(id2name.get(a["category_id"], "?")
+                       for a in coco["annotations"])
+        print(f"\n[check] {split}: {len(coco['images'])} images, "
+              f"{len(coco['annotations'])} annotations, "
+              f"{len(hist)} classes")
+        for name, n in hist.most_common():
+            print(f"        {n:6d} x {name}")
+    try:
+        from render_gt_overlays import render_split
+        for split in ("train", "valid", "test"):
+            n = render_split(args.out / split, args.out / "_gt_check" / split,
+                             n=12, seed=0)
+            if n:
+                print(f"[check] {n} GT overlays -> {args.out/'_gt_check'/split}")
+    except Exception as e:
+        print(f"[check] GT overlay sampling failed (non-fatal): {e}")
 
     # 4) Clean up preprocessing artifacts unless --keep-intermediates
     if not args.keep_intermediates:
