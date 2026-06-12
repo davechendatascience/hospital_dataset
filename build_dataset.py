@@ -50,7 +50,7 @@ from fixed_categories import (  # type: ignore  # noqa: E402
     FIXED_CATEGORIES, class_from_entry)
 
 DEFAULT_STAGE          = PROJECT_ROOT / "Collected_Ward0505" / "Ward0505.usd"
-DEFAULT_REAL_TEST_ROOT = Path("/home/edge-host/Documents/Ward_dataset0518")
+DEFAULT_REAL_TEST_ROOT = PROJECT_ROOT / "Ward_dataset0518"
 DEFAULT_ISAAC_PYTHON   = Path.home() / "isaac-sim" / "python.sh"
 DEFAULT_REPLICATOR     = PROJECT_ROOT / "replicator_dataset.py"
 
