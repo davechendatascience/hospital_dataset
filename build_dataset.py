@@ -101,6 +101,11 @@ def parse_args() -> argparse.Namespace:
                         "each object's ORIGINAL material in place (diffuse-"
                         "texture tint, colour jitter, roughness re-rolls). "
                         "No texture bank needed.")
+    p.add_argument("--render-depth", action="store_true",
+                   help="Forward --extra-channels to replicator_dataset.py so "
+                        "GT depth/normals land in _raw, and emit per-image "
+                        "depth PNGs to <split>/depth/ (for the Cosmos depth "
+                        "control). Requires --keep-intermediates to keep _raw.")
     p.add_argument("--randomize-placement", action="store_true",
                    help="Forward to replicator_dataset.py: per-frame MEANINGFUL "
                         "placement DR -- free-standing furniture moves as rigid "
@@ -211,6 +216,8 @@ def run_replicator(args: argparse.Namespace, split: str, n_frames: int,
         "--hfov",     str(args.hfov),
         "--rt-subframes", str(args.rt_subframes),
     ]
+    if getattr(args, "render_depth", False):
+        cmd += ["--extra-channels"]   # GT depth/normals -> _raw (for Cosmos depth control)
     if getattr(args, "randomize_materials", False):
         cmd += ["--randomize-materials"]
     if getattr(args, "randomize_placement", False):
@@ -439,9 +446,28 @@ def _gpu_check_frame(rgb_path, inst_png, sem_map_path, prune_cfg,
     return True, anns_meta, H, W, ""
 
 
+def _depth_png(npy_path: Path, invert: bool = True) -> "Image.Image":
+    """Radial-depth .npy (metric) -> 8-bit grayscale PNG, per-image min-max,
+    near=bright. Matches the encoding gen_cosmos_jobs feeds to the Cosmos
+    depth control (it reads the PNG and converts to 3-channel)."""
+    d = np.load(npy_path).astype(np.float32)
+    finite = np.isfinite(d) & (d < 1e6)
+    if finite.any():
+        d = np.where(finite, d, d[finite].max())   # background -> farthest
+        lo, hi = d.min(), d.max()
+        norm = (d - lo) / (hi - lo + 1e-6)
+        if invert:
+            norm = 1.0 - norm                       # near = bright
+        img = (norm * 255).astype(np.uint8)
+    else:
+        img = np.zeros(d.shape, np.uint8)
+    return Image.fromarray(img, mode="L")
+
+
 def convert_raw_to_coco(raw_dir: Path, split_dir: Path,
                        category_map: dict, min_mask_area: int,
-                       prune_cfg: dict, target_count=None, seed=0) -> dict:
+                       prune_cfg: dict, target_count=None, seed=0,
+                       write_depth: bool = False) -> dict:
     """Read BasicWriter outputs, produce COCO with RLE instance masks. Apply
     the CLIP void filter (drops frames whose CLIP embedding looks more like
     a 'dark void between walls' than a 'hospital interior') and a sanity
@@ -605,6 +631,10 @@ def convert_raw_to_coco(raw_dir: Path, split_dir: Path,
         ],
     }
     ann_id = 1
+    depth_dir = split_dir / "depth"
+    n_depth = n_depth_miss = 0
+    if write_depth:
+        depth_dir.mkdir(parents=True, exist_ok=True)
     for new_image_id, s in enumerate(survivors, start=1):
         img_name = f"img_{s['idx']}.png"
         target_img = split_dir / img_name
@@ -613,6 +643,16 @@ def convert_raw_to_coco(raw_dir: Path, split_dir: Path,
             "id": new_image_id, "file_name": img_name,
             "width": s["W"], "height": s["H"],
         })
+        if write_depth:
+            # Depth sibling for the Cosmos depth control: depth/img_<idx>.png
+            # (gen_cosmos_jobs reads <sim-dir>/../depth, so point --sim-dir
+            # at <split>/images and depth lands beside it).
+            dnpy = s["rgb_path"].parent / f"distance_to_camera_{s['idx']}.npy"
+            if dnpy.is_file():
+                _depth_png(dnpy).save(depth_dir / f"img_{s['idx']}.png")
+                n_depth += 1
+            else:
+                n_depth_miss += 1
         # Reload instance map only for this kept frame to derive masks
         inst_map = np.asarray(Image.open(s["inst_png"]))
         if inst_map.ndim != 2:
@@ -638,6 +678,9 @@ def convert_raw_to_coco(raw_dir: Path, split_dir: Path,
           + ", ".join(f"{k}={v}" for k, v in drops.items()))
     print(f"[coco]   per-ann skips (within kept frames): "
           + ", ".join(f"{k}={v}" for k, v in skipped_ann.items()))
+    if write_depth:
+        print(f"[depth] {split_dir.name}: wrote {n_depth} depth PNGs -> "
+              f"{depth_dir} (missing {n_depth_miss})")
     return coco
 
 
@@ -810,10 +853,12 @@ def main() -> None:
               f"(dark<{args.dark_thresh}) | min_objects>={args.prune_min_objects}")
     convert_raw_to_coco(train_raw, args.out / "train", FIXED_CATEGORIES,
                         args.min_mask_area, prune_cfg,
-                        target_count=train_target, seed=args.train_seed)
+                        target_count=train_target, seed=args.train_seed,
+                        write_depth=args.render_depth)
     convert_raw_to_coco(val_raw,   args.out / "valid", FIXED_CATEGORIES,
                         args.min_mask_area, prune_cfg,
-                        target_count=val_target,   seed=args.val_seed)
+                        target_count=val_target,   seed=args.val_seed,
+                        write_depth=args.render_depth)
 
     # 3) Copy + remap the real test set
     if not args.skip_test:
