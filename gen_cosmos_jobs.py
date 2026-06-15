@@ -97,6 +97,14 @@ def main():
                          "Set 0 to disable depth control.")
     ap.add_argument("--depth-dir", type=Path, default=None,
                     help="dir of depth PNGs (default <sim-dir>/../depth).")
+    ap.add_argument("--uniform-controls", dest="uniform_controls",
+                    action="store_true", default=True,
+                    help="Only emit jobs whose control set is complete "
+                         "(seg + depth when --depth-weight>0), so Cosmos can "
+                         "batch them through one multibranch model. ON by "
+                         "default; frames missing depth are skipped + reported.")
+    ap.add_argument("--no-uniform-controls", dest="uniform_controls",
+                    action="store_false")
     ap.add_argument("--guided", dest="guided", action="store_true", default=True,
                     help="guided generation: anchor the labeled foreground (union of object "
                          "masks) during denoising so object structure/identity is preserved.")
@@ -189,10 +197,21 @@ def main():
     for d in (cfg_dir, seg_dir, depth_out, fg_dir):
         d.mkdir(parents=True, exist_ok=True)
     out_root = (args.out / "outputs").resolve()
-    manifest, n_cap, n_seg, n_depth, n_guided = [], 0, 0, 0, 0
+    manifest, n_cap, n_seg, n_depth, n_guided, n_skip = [], 0, 0, 0, 0, 0
     for p in sim_files:
         stem = Path(p).stem
         img_id = stem2id.get(stem)
+        # UNIFORM CONTROLS: Cosmos batches all configs through one model, so
+        # every emitted job must carry the SAME hint keys -- a frame missing
+        # depth (render warmup) or seg would make the multibranch model's
+        # hints indexing go out of range. Skip such frames (still usable for
+        # direct training; just not styled). --no-uniform-controls disables.
+        if args.uniform_controls:
+            has_seg = img_id is not None
+            has_depth = (args.depth_weight <= 0) or (depth_dir / f"{stem}.png").is_file()
+            if not (has_seg and has_depth):
+                n_skip += 1
+                continue
         present = {nm[a["category_id"]] for a in coco.imgToAnns.get(img_id, [])
                    if a["category_id"] != 0}          # actual object classes in this frame
         rng = random.Random(stem)                   # deterministic per-image variance
@@ -258,6 +277,10 @@ def main():
     print(f"[cosmos-jobs] controls: seg={n_seg} (w={args.seg_weight}), depth={n_depth} "
           f"(w={args.depth_weight}), edge (w={args.edge_weight}), guidance={args.guidance}, "
           f"guided-fg-mask={n_guided} (steps={args.guided_steps})")
+    if n_skip:
+        print(f"[cosmos-jobs] uniform-controls: SKIPPED {n_skip} frames missing "
+              f"seg/depth (not styled; still in the dataset for direct training). "
+              f"seg={n_seg}==depth={n_depth} -> control set is uniform.")
 
     # RESUMABLE batch runner: each pass runs inference (model loaded once) on the configs
     # whose output jpg doesn't exist yet; if a frame aborts the batch, the loop restarts
