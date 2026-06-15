@@ -141,9 +141,23 @@ def main():
     for i in range(1, 64):
         r, g, b = colorsys.hsv_to_rgb((i * 0.61803) % 1.0, 0.65, 0.95)
         pal[i] = (int(r * 255), int(g * 255), int(b * 255))
-    coco = COCO(str(args.sim_dir.parent / "_annotations.coco.json"))
+    # Layout-tolerant: --sim-dir may be the <split>/images subdir (the COCO
+    # is at sim_dir/../_annotations.coco.json, depth at sim_dir/../depth) OR
+    # the split root itself (build_dataset puts img_*.png in the root with the
+    # COCO + depth/ beside them). Resolve both against the actual files.
+    def _first_existing(*cands):
+        for c in cands:
+            if c.is_file() or c.is_dir():
+                return c
+        return cands[-1]
+    coco_path = _first_existing(
+        args.sim_dir / "_annotations.coco.json",
+        args.sim_dir.parent / "_annotations.coco.json")
+    coco = COCO(str(coco_path))
     stem2id = {Path(im["file_name"]).stem: i for i, im in coco.imgs.items()}
-    depth_dir = args.depth_dir or (args.sim_dir.parent / "depth")
+    depth_dir = args.depth_dir or _first_existing(
+        args.sim_dir / "depth",
+        args.sim_dir.parent / "depth")
 
     nm = {c["id"]: c["name"] for c in coco.dataset["categories"]}
 
@@ -153,6 +167,8 @@ def main():
     tcoco = COCO(str(args.test_dir / "_annotations.coco.json"))
     tnm = {c["id"]: c["name"] for c in tcoco.dataset["categories"]}
     timg = args.test_dir / "images"
+    if not timg.is_dir():
+        timg = args.test_dir          # images in split root (build_dataset)
     real_refs = []
     for tid, tim in tcoco.imgs.items():
         names = frozenset(tnm[a["category_id"]] for a in tcoco.imgToAnns.get(tid, [])
