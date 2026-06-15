@@ -197,6 +197,12 @@ def main():
     for d in (cfg_dir, seg_dir, depth_out, fg_dir):
         d.mkdir(parents=True, exist_ok=True)
     out_root = (args.out / "outputs").resolve()
+    def _depth_ok(stem):
+        # readable depth: exists AND non-empty (a zero-byte/truncated write
+        # from an interrupted render would otherwise crash Image.open later).
+        f = depth_dir / f"{stem}.png"
+        return f.is_file() and f.stat().st_size > 0
+
     manifest, n_cap, n_seg, n_depth, n_guided, n_skip = [], 0, 0, 0, 0, 0
     for p in sim_files:
         stem = Path(p).stem
@@ -208,7 +214,7 @@ def main():
         # direct training; just not styled). --no-uniform-controls disables.
         if args.uniform_controls:
             has_seg = img_id is not None
-            has_depth = (args.depth_weight <= 0) or (depth_dir / f"{stem}.png").is_file()
+            has_depth = (args.depth_weight <= 0) or _depth_ok(stem)
             if not (has_seg and has_depth):
                 n_skip += 1
                 continue
@@ -249,7 +255,7 @@ def main():
                           "guided_generation_step_threshold": args.guided_steps}
                 n_guided += 1
         dpath = depth_dir / f"{stem}.png"           # DEPTH control
-        if args.depth_weight > 0 and dpath.is_file():
+        if args.depth_weight > 0 and _depth_ok(stem):
             # GT depth is grayscale (mode L); Cosmos's control reader needs HWC/3-channel
             d3 = (depth_out / f"{stem}.png").resolve()
             Image.open(dpath).convert("RGB").save(d3)
