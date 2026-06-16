@@ -82,8 +82,26 @@ MMD²(P,Q) = E_{X,X'}[k(X,X')] + E_{Y,Y'}[k(Y,Y')] − 2·E_{X,Y}[k(X,Y)],
 
 with `X, X' ∼ P` and `Y, Y' ∼ Q` independent. No densities, no
 normalization, no intractable integrals — given samples you plug into a U- or
-V-statistic and you are done. **This is the exact expression `_mmd` computes**
-(`kxx.mean() + kyy.mean() − 2·kxy.mean()`, a biased V-statistic).
+V-statistic and you are done.
+
+**Estimator correctness (what `_mmd` computes).** The naive average over
+*all* pairs is the *biased V-statistic*: it includes the diagonal self-terms
+`k(x_i, x_i)`, which inflates the estimate by the constant diagonal mass so
+that `MMD²(P,P)` does **not** vanish for finite samples. The
+functionally-correct estimator is the **unbiased U-statistic** (Gretton et
+al. 2012): drop the diagonal from the within-sample sums,
+
+```
+MMD²_u =  1/(n(n−1)) Σ_{i≠j} k(x_i,x_j)
+        + 1/(m(m−1)) Σ_{i≠j} k(y_i,y_j)
+        − 2/(nm)      Σ_{i,j}  k(x_i,y_j),
+```
+
+which is 0 in expectation when `P = Q`. This is what `_mmd` now implements
+(the cross term keeps all `i,j` because `X ⊥ Y`). For a kernel with constant
+diagonal (RBF: `k(x,x)=1`) the diagonal only offsets the *value*, not the
+gradient; for any non-constant-diagonal kernel it would leak into the
+gradient too — so the unbiased form is the right default regardless.
 
 **Functional-analytic face** — by Cauchy–Schwarz,
 `‖μ_P − μ_Q‖ = sup_{‖f‖_H ≤ 1} ⟨f, μ_P − μ_Q⟩`, so
@@ -206,7 +224,7 @@ has three terms (`_align_loss`), each an instance of the above:
 
 | Code | Theory | Notes |
 |------|--------|-------|
-| `_mmd(a, b)` | empirical `MMD²` biased V-statistic (§3 computational face) | `kxx.mean()+kyy.mean()−2·kxy.mean()` |
+| `_mmd(a, b)` | empirical `MMD²` **unbiased U-statistic** (§3 computational face) | diagonal excluded; `clamp_min(0)` keeps it a valid distance² |
 | L2-normalize features then RBF | characteristic kernel on the sphere (§2) | removes scale so only direction is compared |
 | `med = median(pairwise d²)`, mix `0.5/1.0/2.0·med` | median heuristic + multi-bandwidth (§4 caveat) | robust to bandwidth misspecification |
 | **global** term: `_mmd(pool(f_sim), pool(f_real))` | embedding of the pooled-feature marginal | one vector per image |
@@ -225,6 +243,20 @@ held-out MMD/probe remains an honest measure of transfer.
 - Alignment weight is a balance: too high and the encoder collapses
   sim features onto real ones at the cost of the supervised seg objective.
   `0.1` is the working default.
+
+### Also in the YOLO pipeline (`train_yolo.py --align-real`)
+The same unbiased `_mmd` is ported to Ultralytics: a `SegmentationModel`
+subclass registers a forward hook on a backbone layer (`--align-layer`,
+default 10 = YOLO11 C2PSA, stride-32) to capture the sim feature map during
+the normal forward, then forwards one unlabeled real batch (`--align-batch`
+from `--align-real`) through the same net so the hook captures the real
+feature map, and adds `--align-weight · MMD(GAP(sim), GAP(real))` to the loss
+(global-average-pooled features). Because Ultralytics' base loss is
+batch-scaled, the align term is multiplied by the batch size to stay
+commensurate — so `--align-weight` here is O(1), not `0.1`. Unlike the
+DETR `dinov2` path (frozen ViT + trainable pyramid), YOLO trains the whole
+backbone, so the alignment gradient flows through the entire feature
+extractor.
 
 ---
 

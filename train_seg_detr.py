@@ -967,16 +967,37 @@ def main() -> None:
         return torch.cat([f.float().mean(dim=(2, 3)) for f in fmaps], dim=1)
 
     def _mmd(a, b):
-        """Multi-bandwidth RBF MMD^2 (biased) on L2-normalized features."""
+        """Unbiased U-statistic estimator of the squared MMD,
+        ‖μ_P − μ_Q‖²_H, for a sum of characteristic RBF kernels with
+        median-heuristic bandwidths, on L2-normalized features (kernel on the
+        unit sphere). See docs/rkhs-mmd-domain-adaptation.md §3-4.
+
+        Functionally-correct estimator (Gretton et al. 2012): the within-
+        sample terms EXCLUDE the diagonal self-similarities k(x_i, x_i), so
+        the estimate is 0 in expectation when P = Q. The biased V-statistic
+        (averaging over all pairs incl. the diagonal) is inflated by the
+        constant diagonal mass and never reaches 0 -- wrong for the reported
+        gap, and for any kernel whose k(x,x) is not constant the diagonal
+        even leaks into the gradient.
+        """
         a = torch.nn.functional.normalize(a, dim=1)
         b = torch.nn.functional.normalize(b, dim=1)
+        n, m = a.shape[0], b.shape[0]
         x = torch.cat([a, b], 0)
         d2 = torch.cdist(x, x).pow(2)
         med = d2.detach().flatten().median().clamp_min(1e-6)
         k = sum(torch.exp(-d2 / (g * med)) for g in (0.5, 1.0, 2.0))
-        n = a.shape[0]
         kxx, kyy, kxy = k[:n, :n], k[n:, n:], k[:n, n:]
-        return kxx.mean() + kyy.mean() - 2 * kxy.mean()
+        cross = 2.0 * kxy.mean()                         # X,Y independent: keep all i,j
+        if n < 2 or m < 2:                               # U-statistic needs >=2 per sample
+            return (kxx.mean() + kyy.mean() - cross).clamp_min(0.0)
+        # off-diagonal (i != j) within-sample sums -> unbiased U-statistic
+        sum_xx = kxx.sum() - kxx.diagonal().sum()
+        sum_yy = kyy.sum() - kyy.diagonal().sum()
+        mmd2 = sum_xx / (n * (n - 1)) + sum_yy / (m * (m - 1)) - cross
+        # true MMD² >= 0; clamp finite-sample negative noise so it stays a
+        # valid squared RKHS distance to minimize (no reward for noise < 0).
+        return mmd2.clamp_min(0.0)
 
     def _local_feats(fmaps, level, n):
         f = fmaps[min(level, len(fmaps) - 1)].float()   # (B, C, H, W)

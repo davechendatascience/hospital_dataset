@@ -68,6 +68,21 @@ def parse_args() -> argparse.Namespace:
                         "they already exist")
     p.add_argument("--skip-train", action="store_true",
                    help="Only convert labels + write data.yaml; don't train")
+    # ---- domain adaptation (MMD feature alignment) ----
+    p.add_argument("--align-real", type=Path, default=None,
+                   help="Dir of UNLABELED real images. Adds an unbiased-MMD "
+                        "loss pulling a backbone feature map's distribution "
+                        "toward these real images each step (same RKHS method "
+                        "as train_seg_detr; see docs/rkhs-mmd-domain-"
+                        "adaptation.md). Off unless set.")
+    p.add_argument("--align-weight", type=float, default=1.0,
+                   help="Weight of the MMD alignment loss (tune: YOLO's base "
+                        "loss is batch-scaled, so the align term is too).")
+    p.add_argument("--align-batch", type=int, default=8,
+                   help="Real images per alignment step.")
+    p.add_argument("--align-layer", type=int, default=10,
+                   help="Backbone layer index to align (YOLO11 default 10 = "
+                        "C2PSA, deepest backbone feature, stride 32).")
     return p.parse_args()
 
 
@@ -214,6 +229,131 @@ def write_data_yaml(data_root: Path, yolo_classes: list[str]) -> Path:
 # main
 # ---------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------- #
+# Domain adaptation: MMD feature alignment (the RKHS method, ported to YOLO)
+# --------------------------------------------------------------------------- #
+# Config is stashed module-level because Ultralytics constructs the trainer/
+# model for us; the trainer reads this in get_model(). Only used when
+# --align-real is set.
+_ALIGN_CFG: dict = {}
+
+
+def _mmd(a, b):
+    """Unbiased U-statistic estimator of squared MMD ‖μ_P−μ_Q‖²_H for a sum of
+    characteristic RBF kernels (median-heuristic bandwidths) on L2-normalized
+    features. Diagonal self-terms excluded (correct estimator; 0 in
+    expectation when P=Q). Mirrors train_seg_detr._mmd. See
+    docs/rkhs-mmd-domain-adaptation.md."""
+    import torch
+    a = torch.nn.functional.normalize(a.float(), dim=1)
+    b = torch.nn.functional.normalize(b.float(), dim=1)
+    n, m = a.shape[0], b.shape[0]
+    x = torch.cat([a, b], 0)
+    d2 = torch.cdist(x, x).pow(2)
+    med = d2.detach().flatten().median().clamp_min(1e-6)
+    k = sum(torch.exp(-d2 / (g * med)) for g in (0.5, 1.0, 2.0))
+    kxx, kyy, kxy = k[:n, :n], k[n:, n:], k[:n, n:]
+    cross = 2.0 * kxy.mean()
+    if n < 2 or m < 2:
+        return (kxx.mean() + kyy.mean() - cross).clamp_min(0.0)
+    sum_xx = kxx.sum() - kxx.diagonal().sum()
+    sum_yy = kyy.sum() - kyy.diagonal().sum()
+    return (sum_xx / (n * (n - 1)) + sum_yy / (m * (m - 1)) - cross).clamp_min(0.0)
+
+
+class _RealLoader:
+    """Infinite, shuffled loader of UNLABELED real images, letterboxed to
+    `imgsz` and normalized exactly like Ultralytics (RGB, CHW, /255)."""
+
+    def __init__(self, image_dir: Path, imgsz: int, batch: int, device,
+                 seed: int = 0):
+        import random as _r
+        exts = (".jpg", ".jpeg", ".png", ".bmp")
+        self.paths = sorted(str(p) for p in Path(image_dir).iterdir()
+                            if p.suffix.lower() in exts)
+        if not self.paths:
+            raise SystemExit(f"--align-real: no images in {image_dir}")
+        self.imgsz, self.batch, self.device = imgsz, batch, device
+        self._rng = _r.Random(seed)
+        self._rng.shuffle(self.paths)
+        self._i = 0
+
+    def _letterbox(self, im):
+        h, w = im.shape[:2]
+        r = min(self.imgsz / h, self.imgsz / w)
+        nh, nw = int(round(h * r)), int(round(w * r))
+        im = cv2.resize(im, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        canvas = np.full((self.imgsz, self.imgsz, 3), 114, np.uint8)
+        top, left = (self.imgsz - nh) // 2, (self.imgsz - nw) // 2
+        canvas[top:top + nh, left:left + nw] = im
+        return canvas
+
+    def __next__(self):
+        import torch
+        batch = []
+        for _ in range(self.batch):
+            if self._i >= len(self.paths):
+                self._i = 0
+                self._rng.shuffle(self.paths)
+            im = cv2.imread(self.paths[self._i]); self._i += 1
+            if im is None:
+                continue
+            im = self._letterbox(im)[:, :, ::-1]          # BGR->RGB
+            t = torch.from_numpy(np.ascontiguousarray(im)).permute(2, 0, 1)
+            batch.append(t.float() / 255.0)
+        x = torch.stack(batch, 0).to(self.device, non_blocking=True)
+        return x
+
+
+def _build_align_trainer():
+    """Return a SegmentationTrainer subclass whose model adds the MMD
+    alignment term. Imported lazily so the non-aligned path needs no extra
+    Ultralytics internals."""
+    import torch
+    from ultralytics.models.yolo.segment import SegmentationTrainer
+    from ultralytics.nn.tasks import SegmentationModel
+    from ultralytics.utils import RANK
+
+    class AlignSegmentationModel(SegmentationModel):
+        def init_align(self, cfg):
+            self._align = {"loader": None, "feat": None, **cfg}
+            layer = min(cfg["layer"], len(self.model) - 1)
+            self.model[layer].register_forward_hook(
+                lambda mod, inp, out: self._align.__setitem__("feat", out))
+
+        def loss(self, batch, preds=None):
+            loss, items = super().loss(batch, preds)     # forwards img -> hook=sim feat
+            a = getattr(self, "_align", None)
+            if not a or a["weight"] <= 0:
+                return loss, items
+            sim_feat = a["feat"]
+            if a["loader"] is None:
+                dev = next(self.parameters()).device
+                a["loader"] = _RealLoader(a["real_dir"], a["imgsz"],
+                                          a["batch"], dev)
+            real = next(a["loader"])
+            _ = self.forward(real)                        # tensor -> predict, hook=real feat
+            real_feat = a["feat"]
+
+            def gap(f):                                   # global avg pool -> (B,C)
+                return f.mean(dim=(2, 3)) if f.dim() == 4 else f
+            bs = batch["img"].shape[0]                    # match Ultralytics' batch-scaled loss
+            align = a["weight"] * bs * _mmd(gap(sim_feat), gap(real_feat))
+            return loss + align, items
+
+    class AlignSegmentationTrainer(SegmentationTrainer):
+        def get_model(self, cfg=None, weights=None, verbose=True):
+            model = AlignSegmentationModel(
+                cfg, nc=self.data["nc"], ch=self.data["channels"],
+                verbose=verbose and RANK == -1)
+            if weights:
+                model.load(weights)
+            model.init_align(_ALIGN_CFG)
+            return model
+
+    return AlignSegmentationTrainer
+
+
 def main() -> None:
     args = parse_args()
     data_root = args.data.expanduser().resolve()
@@ -312,6 +452,20 @@ def main() -> None:
 
     model.add_callback("on_fit_epoch_end", _eval_test_split)
 
+    # Domain adaptation: wire the MMD-alignment trainer only when requested.
+    train_extra = {}
+    if args.align_real is not None:
+        align_dir = args.align_real.expanduser().resolve()
+        if not align_dir.is_dir():
+            sys.exit(f"--align-real {align_dir} does not exist")
+        _ALIGN_CFG.update(real_dir=align_dir, imgsz=args.imgsz,
+                          batch=args.align_batch, weight=args.align_weight,
+                          layer=args.align_layer)
+        train_extra["trainer"] = _build_align_trainer()
+        print(f"[yolo][align] MMD alignment ON: real={align_dir}, "
+              f"weight={args.align_weight}, batch={args.align_batch}, "
+              f"backbone layer={args.align_layer}")
+
     model.train(
         data=str(yaml_path),
         epochs=args.epochs,
@@ -328,6 +482,7 @@ def main() -> None:
         translate=0.1, scale=0.4, fliplr=0.5,
         mosaic=1.0, mixup=0.0, copy_paste=0.0,
         plots=True,
+        **train_extra,
     )
 
 
