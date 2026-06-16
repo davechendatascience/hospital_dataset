@@ -310,73 +310,116 @@ class _RealLoader:
         return x
 
 
-def _build_align_trainer():
-    """Return a SegmentationTrainer subclass whose model adds the MMD
-    alignment term. Imported lazily so the non-aligned path needs no extra
-    Ultralytics internals."""
-    import torch
-    from ultralytics.models.yolo.segment import SegmentationTrainer
-    from ultralytics.nn.tasks import SegmentationModel
-    from ultralytics.utils import RANK
+# Alignment trainer/model are defined at MODULE level (not in a factory) so
+# the model class is picklable -- Ultralytics torch.saves the whole model into
+# the checkpoint. Imports are guarded so the non-aligned path still works if
+# something is off; main() checks _ALIGN_AVAILABLE before using them.
+import torch  # noqa: E402
 
-    class AlignSegmentationModel(SegmentationModel):
+try:
+    from ultralytics.models.yolo.segment import SegmentationTrainer as _SegTrainer
+    from ultralytics.nn.tasks import SegmentationModel as _SegModel
+    from ultralytics.utils import RANK as _RANK
+
+    def _feat_hook(module, inp, out):
+        # Store the captured feature ON THE SUBMODULE via a named module-level
+        # function (not a closure/lambda) so the model stays picklable. The
+        # value is cleared after each loss() so no tensor lingers at save.
+        module._align_feat = out
+
+    class AlignSegmentationModel(_SegModel):
+        """SegmentationModel + per-location MMD domain-alignment loss."""
+
         def init_align(self, cfg):
-            self._align = {"loader": None, "feat": None, **cfg}
-            layer = min(cfg["layer"], len(self.model) - 1)
-            self.model[layer].register_forward_hook(
-                lambda mod, inp, out: self._align.__setitem__("feat", out))
+            self._align = {"loader": None, **cfg}
+            self._align_layer = min(cfg["layer"], len(self.model) - 1)
+            self.model[self._align_layer].register_forward_hook(_feat_hook)
 
         def loss(self, batch, preds=None):
-            loss, items = super().loss(batch, preds)     # forwards img -> hook=sim feat
+            loss, items = super().loss(batch, preds)   # forward -> hook stores sim feat
             a = getattr(self, "_align", None)
-            # Train-only: the validator also calls model.loss (to report val
-            # loss) with the model in eval mode -- skip alignment there so we
-            # don't waste real forwards and keep val loss_items at base length.
-            if not a or a["weight"] <= 0 or not self.training:
-                return loss, items
-            sim_feat = a["feat"]
-            if a["loader"] is None:
-                dev = next(self.parameters()).device
-                a["loader"] = _RealLoader(a["real_dir"], a["imgsz"],
-                                          a["batch"], dev)
-            real = next(a["loader"])
-            _ = self.forward(real)                        # tensor -> predict, hook=real feat
-            real_feat = a["feat"]
+            if a is None:
+                return loss, items                      # stripped at save -> vanilla model
+            layer = self.model[self._align_layer]
+            # Alignment runs ONLY in training with positive weight; in eval
+            # (the validator also calls model.loss) we still append a 0 so
+            # loss_items keeps the SAME length as the extended loss_names.
+            if a["weight"] > 0 and self.training:
+                sim_feat = layer._align_feat
+                if a["loader"] is None:
+                    dev = next(self.parameters()).device
+                    a["loader"] = _RealLoader(a["real_dir"], a["imgsz"],
+                                              a["batch"], dev)
+                real = next(a["loader"])
+                _ = self.forward(real)                  # tensor -> predict, hook stores real feat
+                real_feat = layer._align_feat
 
-            def perloc(f, n):                             # sample per-LOCATION feats -> (n,C)
-                x = f.permute(0, 2, 3, 1).reshape(-1, f.shape[1]).float()
-                idx = torch.randperm(x.shape[0], device=x.device)[:n]
-                return x[idx]
-            n = a["locations"]
-            mmd2 = _mmd(perloc(sim_feat, n), perloc(real_feat, n))  # raw unbiased MMD² (logged)
-            bs = batch["img"].shape[0]                    # match Ultralytics' batch-scaled loss
-            loss = loss + a["weight"] * bs * mmd2
-            # surface the raw MMD as an extra logged loss item ("mmd" column /
+                def perloc(f, n):                       # per-LOCATION feats -> (n,C)
+                    x = f.permute(0, 2, 3, 1).reshape(-1, f.shape[1]).float()
+                    idx = torch.randperm(x.shape[0], device=x.device)[:n]
+                    return x[idx]
+                n = a["locations"]
+                mmd2 = _mmd(perloc(sim_feat, n), perloc(real_feat, n))  # raw unbiased MMD²
+                loss = loss + a["weight"] * batch["img"].shape[0] * mmd2
+                mmd_log = mmd2.detach()
+            else:
+                mmd_log = items.new_zeros(())
+            layer._align_feat = None                    # no tensor left on the module (save-safe)
+            # surface the raw MMD as an extra logged item ("mmd" column /
             # train/mmd in results.csv); loss_names is extended in the trainer.
-            items = torch.cat([items, mmd2.detach().reshape(1).to(items)])
+            items = torch.cat([items, mmd_log.reshape(1).to(items)])
             return loss, items
 
-    class AlignSegmentationTrainer(SegmentationTrainer):
+    class AlignSegmentationTrainer(_SegTrainer):
         def get_model(self, cfg=None, weights=None, verbose=True):
             model = AlignSegmentationModel(
                 cfg, nc=self.data["nc"], ch=self.data["channels"],
-                verbose=verbose and RANK == -1)
+                verbose=verbose and _RANK == -1)
             if weights:
                 model.load(weights)
             model.init_align(_ALIGN_CFG)
             return model
 
         def get_validator(self):
-            # parent sets the 5 base loss names here; append "mmd" so it gets
-            # a progress-bar column + a train/mmd column in results.csv. The
-            # validator's shorter (base-length) loss tensor just truncates
-            # against these names, so val rows are unaffected.
+            # parent sets the 5 base loss names here; append "mmd" for the
+            # progress-bar column + train/mmd in results.csv.
             v = super().get_validator()
             if "mmd" not in self.loss_names:
                 self.loss_names = (*self.loss_names, "mmd")
             return v
 
-    return AlignSegmentationTrainer
+        def save_model(self):
+            # The checkpoint is pickled/deepcopied: strip the alignment state
+            # (forward hook + captured feature + config) from the live model
+            # AND the EMA so the saved model is a plain, loadable
+            # SegmentationModel -- reloading it (e.g. for per-epoch test eval)
+            # then won't append a phantom 'mmd' loss item against base names.
+            mods = [self.model]
+            if getattr(self, "ema", None) is not None and self.ema.ema is not None:
+                mods.append(self.ema.ema)
+            stash = []
+            for m in mods:
+                m = getattr(m, "module", m)             # de-parallel
+                al = getattr(m, "_align", None)
+                lyr = getattr(m, "_align_layer", None)
+                stash.append((m, al, lyr))
+                if al is not None:
+                    m._align = None
+                if lyr is not None:
+                    m.model[lyr]._forward_hooks.clear()
+                    m.model[lyr]._align_feat = None
+            try:
+                super().save_model()
+            finally:
+                for m, al, lyr in stash:
+                    if al is not None:
+                        m._align = al
+                    if lyr is not None:
+                        m.model[lyr].register_forward_hook(_feat_hook)
+
+    _ALIGN_AVAILABLE = True
+except Exception as _align_import_err:                  # ultralytics import issue
+    _ALIGN_AVAILABLE = False
 
 
 def main() -> None:
@@ -483,10 +526,13 @@ def main() -> None:
         align_dir = args.align_real.expanduser().resolve()
         if not align_dir.is_dir():
             sys.exit(f"--align-real {align_dir} does not exist")
+        if not _ALIGN_AVAILABLE:
+            sys.exit("--align-real requested but the alignment trainer failed "
+                     "to import (ultralytics internals). See startup error.")
         _ALIGN_CFG.update(real_dir=align_dir, imgsz=args.imgsz,
                           batch=args.align_batch, weight=args.align_weight,
                           layer=args.align_layer, locations=args.align_locations)
-        train_extra["trainer"] = _build_align_trainer()
+        train_extra["trainer"] = AlignSegmentationTrainer
         print(f"[yolo][align] MMD alignment ON: real={align_dir}, "
               f"weight={args.align_weight}, batch={args.align_batch}, "
               f"backbone layer={args.align_layer}")
