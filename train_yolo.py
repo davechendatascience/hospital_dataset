@@ -83,6 +83,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--align-layer", type=int, default=10,
                    help="Backbone layer index to align (YOLO11 default 10 = "
                         "C2PSA, deepest backbone feature, stride 32).")
+    p.add_argument("--align-locations", type=int, default=1024,
+                   help="Per-side spatial locations sampled from the feature "
+                        "map for the MMD. Per-LOCATION features are used (not "
+                        "global-average-pooled): pooled conv features collapse "
+                        "in high-D and give a degenerate ~0 MMD.")
     return p.parse_args()
 
 
@@ -324,7 +329,10 @@ def _build_align_trainer():
         def loss(self, batch, preds=None):
             loss, items = super().loss(batch, preds)     # forwards img -> hook=sim feat
             a = getattr(self, "_align", None)
-            if not a or a["weight"] <= 0:
+            # Train-only: the validator also calls model.loss (to report val
+            # loss) with the model in eval mode -- skip alignment there so we
+            # don't waste real forwards and keep val loss_items at base length.
+            if not a or a["weight"] <= 0 or not self.training:
                 return loss, items
             sim_feat = a["feat"]
             if a["loader"] is None:
@@ -335,11 +343,18 @@ def _build_align_trainer():
             _ = self.forward(real)                        # tensor -> predict, hook=real feat
             real_feat = a["feat"]
 
-            def gap(f):                                   # global avg pool -> (B,C)
-                return f.mean(dim=(2, 3)) if f.dim() == 4 else f
+            def perloc(f, n):                             # sample per-LOCATION feats -> (n,C)
+                x = f.permute(0, 2, 3, 1).reshape(-1, f.shape[1]).float()
+                idx = torch.randperm(x.shape[0], device=x.device)[:n]
+                return x[idx]
+            n = a["locations"]
+            mmd2 = _mmd(perloc(sim_feat, n), perloc(real_feat, n))  # raw unbiased MMD² (logged)
             bs = batch["img"].shape[0]                    # match Ultralytics' batch-scaled loss
-            align = a["weight"] * bs * _mmd(gap(sim_feat), gap(real_feat))
-            return loss + align, items
+            loss = loss + a["weight"] * bs * mmd2
+            # surface the raw MMD as an extra logged loss item ("mmd" column /
+            # train/mmd in results.csv); loss_names is extended in the trainer.
+            items = torch.cat([items, mmd2.detach().reshape(1).to(items)])
+            return loss, items
 
     class AlignSegmentationTrainer(SegmentationTrainer):
         def get_model(self, cfg=None, weights=None, verbose=True):
@@ -350,6 +365,16 @@ def _build_align_trainer():
                 model.load(weights)
             model.init_align(_ALIGN_CFG)
             return model
+
+        def get_validator(self):
+            # parent sets the 5 base loss names here; append "mmd" so it gets
+            # a progress-bar column + a train/mmd column in results.csv. The
+            # validator's shorter (base-length) loss tensor just truncates
+            # against these names, so val rows are unaffected.
+            v = super().get_validator()
+            if "mmd" not in self.loss_names:
+                self.loss_names = (*self.loss_names, "mmd")
+            return v
 
     return AlignSegmentationTrainer
 
@@ -460,7 +485,7 @@ def main() -> None:
             sys.exit(f"--align-real {align_dir} does not exist")
         _ALIGN_CFG.update(real_dir=align_dir, imgsz=args.imgsz,
                           batch=args.align_batch, weight=args.align_weight,
-                          layer=args.align_layer)
+                          layer=args.align_layer, locations=args.align_locations)
         train_extra["trainer"] = _build_align_trainer()
         print(f"[yolo][align] MMD alignment ON: real={align_dir}, "
               f"weight={args.align_weight}, batch={args.align_batch}, "

@@ -250,13 +250,26 @@ subclass registers a forward hook on a backbone layer (`--align-layer`,
 default 10 = YOLO11 C2PSA, stride-32) to capture the sim feature map during
 the normal forward, then forwards one unlabeled real batch (`--align-batch`
 from `--align-real`) through the same net so the hook captures the real
-feature map, and adds `--align-weight · MMD(GAP(sim), GAP(real))` to the loss
-(global-average-pooled features). Because Ultralytics' base loss is
-batch-scaled, the align term is multiplied by the batch size to stay
-commensurate — so `--align-weight` here is O(1), not `0.1`. Unlike the
-DETR `dinov2` path (frozen ViT + trainable pyramid), YOLO trains the whole
-backbone, so the alignment gradient flows through the entire feature
-extractor.
+feature map, and adds `--align-weight · MMD` to the loss. Because
+Ultralytics' base loss is batch-scaled, the align term is multiplied by the
+batch size to stay commensurate — so `--align-weight` here is O(1), not
+`0.1`. Unlike the DETR `dinov2` path (frozen ViT + trainable pyramid), YOLO
+trains the whole backbone, so the alignment gradient flows through the entire
+feature extractor. The raw MMD² is logged live as an `mmd` column in the
+progress bar and a `train/mmd` column in `results.csv` (alignment runs in
+training only; the validator's `model.loss` call is guarded out).
+
+**Use per-LOCATION features, not global-pooled (load-bearing).** The first
+cut pooled the feature map to one vector per image and L2-normalized it —
+which gave a *degenerate ~0 MMD even between random-noise and real images*:
+globally-pooled conv features are non-negative and nearly collinear, and 8
+points in 512-D suffer hard distance concentration, so the median-bandwidth
+kernel matrix goes constant (`kxx≈kyy≈kxy ⇒ MMD≈0`). This is exactly the §4
+power-degradation caveat. The fix (`--align-locations`, default 1024) samples
+per-spatial-location feature vectors from the map — many more samples with
+real variance — which is discriminative (sim-vs-real MMD > real-vs-real >
+0). It mirrors `train_seg_detr`'s local-alignment term, which is why the
+DETR path (global + **local** + EMA) was never degenerate.
 
 ---
 
