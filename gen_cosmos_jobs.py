@@ -98,13 +98,13 @@ def main():
     ap.add_argument("--depth-dir", type=Path, default=None,
                     help="dir of depth PNGs (default <sim-dir>/../depth).")
     ap.add_argument("--uniform-controls", dest="uniform_controls",
-                    action="store_true", default=True,
-                    help="Only emit jobs whose control set is complete "
-                         "(seg + depth when --depth-weight>0), so Cosmos can "
-                         "batch them through one multibranch model. ON by "
-                         "default; frames missing depth are skipped + reported.")
-    ap.add_argument("--no-uniform-controls", dest="uniform_controls",
-                    action="store_false")
+                    action="store_true", default=False,
+                    help="Also require a depth control on every emitted job "
+                         "(skip frames missing GT depth). OFF by default -- "
+                         "Cosmos's multibranch model handles per-frame depth "
+                         "presence fine (depthless frames style correctly); "
+                         "the load-bearing skip is empty-foreground frames, "
+                         "which is always on.")
     ap.add_argument("--guided", dest="guided", action="store_true", default=True,
                     help="guided generation: anchor the labeled foreground (union of object "
                          "masks) during denoising so object structure/identity is preserved.")
@@ -203,23 +203,26 @@ def main():
         f = depth_dir / f"{stem}.png"
         return f.is_file() and f.stat().st_size > 0
 
-    manifest, n_cap, n_seg, n_depth, n_guided, n_skip = [], 0, 0, 0, 0, 0
+    manifest, n_cap, n_seg, n_depth, n_guided = [], 0, 0, 0, 0
+    n_skip_empty = n_skip = 0
     for p in sim_files:
         stem = Path(p).stem
         img_id = stem2id.get(stem)
-        # UNIFORM CONTROLS: Cosmos batches all configs through one model, so
-        # every emitted job must carry the SAME hint keys -- a frame missing
-        # depth (render warmup) or seg would make the multibranch model's
-        # hints indexing go out of range. Skip such frames (still usable for
-        # direct training; just not styled). --no-uniform-controls disables.
-        if args.uniform_controls:
-            has_seg = img_id is not None
-            has_depth = (args.depth_weight <= 0) or _depth_ok(stem)
-            if not (has_seg and has_depth):
-                n_skip += 1
-                continue
-        present = {nm[a["category_id"]] for a in coco.imgToAnns.get(img_id, [])
-                   if a["category_id"] != 0}          # actual object classes in this frame
+        # EMPTY-FOREGROUND SKIP (load-bearing): random cameras sometimes catch
+        # no labeled objects -> the guided-generation mask is all-zero, which
+        # makes Cosmos's guided path produce no foreground labels and the VACE
+        # control branch emit too few hints -> `hints[block_id]` IndexError.
+        # Such frames have nothing to style/anchor anyway, so drop them.
+        anns = [a for a in coco.imgToAnns.get(img_id, []) if a["category_id"] != 0] \
+            if img_id is not None else []
+        if not anns:
+            n_skip_empty += 1
+            continue
+        # optional, off by default: also require a depth control for uniformity
+        if args.uniform_controls and args.depth_weight > 0 and not _depth_ok(stem):
+            n_skip += 1
+            continue
+        present = {nm[a["category_id"]] for a in anns}   # actual object classes in this frame
         rng = random.Random(stem)                   # deterministic per-image variance
         # prompt names the ACTUAL objects (from labels); scene-agnostic framing
         prompt = caps.get(stem) or build_prompt(present)
@@ -234,26 +237,27 @@ def main():
             prompt = f"{prompt} {rng.choice(STYLE_MODIFIERS)}."
         controls = {}
         guided = {}
-        if img_id is not None:                      # SEG (label) control map + FG mask
-            info = coco.imgs[img_id]; H, W = info["height"], info["width"]
-            seg = np.zeros((H, W, 3), np.uint8)
-            fg = np.zeros((H, W), np.uint8)         # foreground = union of object masks
-            for a in coco.imgToAnns.get(img_id, []):
-                if a["category_id"] != 0:
-                    m = coco.annToMask(a)
-                    seg[m > 0] = pal[a["category_id"] % 64]
-                    fg[m > 0] = 255
-            segp = (seg_dir / f"{stem}.png").resolve()
-            Image.fromarray(seg).save(segp)
-            controls["seg"] = {"control_path": str(segp), "control_weight": args.seg_weight}
-            n_seg += 1
-            if args.guided:                          # anchor labeled foreground during denoise
-                # guided mask must be .npz with 'arr_0' shape (T,H,W); non-zero = foreground
-                fgp = (fg_dir / f"{stem}.npz").resolve()
-                np.savez(str(fgp), fg[None].astype(np.uint8))   # (1,H,W)
-                guided = {"guided_generation_mask": str(fgp),
-                          "guided_generation_step_threshold": args.guided_steps}
-                n_guided += 1
+        info = coco.imgs[img_id]; H, W = info["height"], info["width"]
+        seg = np.zeros((H, W, 3), np.uint8)
+        fg = np.zeros((H, W), np.uint8)             # foreground = union of object masks
+        for a in anns:
+            m = coco.annToMask(a)
+            seg[m > 0] = pal[a["category_id"] % 64]
+            fg[m > 0] = 255
+        if not fg.any():                            # masks decoded to nothing -> skip
+            n_skip_empty += 1
+            continue
+        segp = (seg_dir / f"{stem}.png").resolve()
+        Image.fromarray(seg).save(segp)
+        controls["seg"] = {"control_path": str(segp), "control_weight": args.seg_weight}
+        n_seg += 1
+        if args.guided:                              # anchor labeled foreground during denoise
+            # guided mask must be .npz with 'arr_0' shape (T,H,W); non-zero = foreground
+            fgp = (fg_dir / f"{stem}.npz").resolve()
+            np.savez(str(fgp), fg[None].astype(np.uint8))   # (1,H,W)
+            guided = {"guided_generation_mask": str(fgp),
+                      "guided_generation_step_threshold": args.guided_steps}
+            n_guided += 1
         dpath = depth_dir / f"{stem}.png"           # DEPTH control
         if args.depth_weight > 0 and _depth_ok(stem):
             # GT depth is grayscale (mode L); Cosmos's control reader needs HWC/3-channel
@@ -283,10 +287,13 @@ def main():
     print(f"[cosmos-jobs] controls: seg={n_seg} (w={args.seg_weight}), depth={n_depth} "
           f"(w={args.depth_weight}), edge (w={args.edge_weight}), guidance={args.guidance}, "
           f"guided-fg-mask={n_guided} (steps={args.guided_steps})")
+    if n_skip_empty:
+        print(f"[cosmos-jobs] SKIPPED {n_skip_empty} empty-foreground frames "
+              f"(no labeled objects -> all-zero guided mask crashes Cosmos; "
+              f"nothing to style anyway).")
     if n_skip:
-        print(f"[cosmos-jobs] uniform-controls: SKIPPED {n_skip} frames missing "
-              f"seg/depth (not styled; still in the dataset for direct training). "
-              f"seg={n_seg}==depth={n_depth} -> control set is uniform.")
+        print(f"[cosmos-jobs] uniform-controls: also SKIPPED {n_skip} frames "
+              f"missing GT depth.")
 
     # RESUMABLE batch runner: each pass runs inference (model loaded once) on the configs
     # whose output jpg doesn't exist yet; if a frame aborts the batch, the loop restarts
