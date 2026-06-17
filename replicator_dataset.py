@@ -1231,6 +1231,23 @@ if MATERIAL_DR:
     color_ranges = []     # untextured UsdPreviewSurface -> (path, lo, hi) jitter
     mdl_tint_paths = []   # MDL shaders (OmniPBR etc.) -> tint via diffuse_tint
 
+    # Mirrors must NOT be perturbed: tint / roughness / colour jitter destroys
+    # the reflective MDL and the mirror renders as a flat tinted panel instead
+    # of a reflection. Collect every material bound to a mirror prim and skip
+    # those below (handles mirrors that share a material with other prims too).
+    _mirror_roots = [ot["path"] for ot in object_targets if ot["class"] == "mirror"]
+    _mirror_mats = set()
+    for _mroot in _mirror_roots:
+        mp = stage.GetPrimAtPath(_mroot)
+        if not mp.IsValid():
+            continue
+        for prim in Usd.PrimRange(mp):
+            if not prim.IsA(UsdGeom.Gprim):
+                continue
+            mmat, _ = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial()
+            if mmat:
+                _mirror_mats.add(mmat.GetPath())
+
     # Resolve each labeled object's bound material via the binding API (the
     # materials live inside the referenced .usdz subtrees, but this also
     # catches ones bound from a shared /World/Looks scope).
@@ -1243,6 +1260,8 @@ if MATERIAL_DR:
             if not mat or mat.GetPath() in _seen_mats:
                 continue
             _seen_mats.add(mat.GetPath())
+            if mat.GetPath() in _mirror_mats:    # keep mirrors reflective
+                continue
             try:
                 surf, _, _ = mat.ComputeSurfaceSource(["mdl"])
             except TypeError:  # older USD: single render-context token
@@ -1288,7 +1307,9 @@ if MATERIAL_DR:
     # buffered tail prints are silently lost from redirected logs.
     print(f"[material-dr] perturbing originals: {len(tex_scale_paths)} textured "
           f"+ {len(color_ranges)} flat-colour + {len(mdl_tint_paths)} MDL "
-          f"shaders across {len(_seen_mats)} bound materials", flush=True)
+          f"shaders across {len(_seen_mats)} bound materials "
+          f"({len(_mirror_mats)} mirror material(s) excluded -> stay reflective)",
+          flush=True)
     if not (tex_scale_paths or color_ranges or mdl_tint_paths):
         print("[material-dr] no perturbable shaders found -> disabling material DR")
         MATERIAL_DR = False
