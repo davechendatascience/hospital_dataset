@@ -202,14 +202,20 @@ def deactivate_existing_replicator(stage: Usd.Stage) -> int:
 
 def mute_studio_and_per_asset_lights(stage: Usd.Stage, ambient_dome_intensity=120.0):
     """Tone down the lights that gave the scene a "Grey Studio" look while
-    KEEPING enough ambient illumination that the camera isn't shooting in the
-    dark. Specifically:
-      - /World/RectLight* : kept and re-randomized by Replicator (ceiling fixtures)
-      - /Environment/Grey_Studio/DomeLight : reduced to `ambient_dome_intensity`
-        (default 120) so we still get soft ambient fill from all directions
-      - /Environment/Grey_Studio/DistantLight : muted (directional sunlight
-        contributed the most to the synthetic look)
-      - everything else (per-asset env_light DomeLights): muted to 0
+    KEEPING the room's actual lighting at its authored intensity (so the
+    camera isn't shooting in the dark). The rule is naming-AGNOSTIC -- it works
+    across scene versions whose ceiling fixtures are named differently
+    (Ward0505 used /World/RectLight*; Ward0524 uses /World/Ceil*,
+    /World/DiskLight*, /World/Hospital_SunLight, ...):
+
+      - any TOP-LEVEL /World light (direct child, e.g. /World/DiskLight,
+        /World/Hospital_SunLight, /World/RectLight) is the room's intended
+        lighting -> KEPT at its authored intensity.
+      - /Environment/Grey_Studio/DomeLight -> reduced to `ambient_dome_intensity`
+        (soft ambient fill).
+      - /Environment/Grey_Studio/DistantLight -> muted (synthetic studio sun).
+      - nested per-asset lights (/World/<asset>/.../env_light DomeLights left
+        over from per-object capture) -> muted to 0.
     """
     muted = []
     kept = []
@@ -221,7 +227,9 @@ def mute_studio_and_per_asset_lights(stage: Usd.Stage, ambient_dome_intensity=12
             "SphereLight", "CylinderLight",
         ):
             continue
-        if path.startswith("/World/RectLight"):
+        # Top-level /World light = a direct child of /World (depth 2). That is
+        # the room lighting in every scene version; keep it as authored.
+        if path.startswith("/World/") and path.count("/") == 2:
             kept.append(path)
             continue
         light = UsdLux.LightAPI(prim)
@@ -230,7 +238,7 @@ def mute_studio_and_per_asset_lights(stage: Usd.Stage, ambient_dome_intensity=12
                 light.GetIntensityAttr().Set(float(ambient_dome_intensity))
                 ambient.append(path)
             else:
-                # DistantLight + per-asset env_lights -> zero
+                # Grey_Studio DistantLight + nested per-asset env_lights -> zero
                 light.GetIntensityAttr().Set(0.0)
                 muted.append(path)
         except Exception as e:
@@ -244,9 +252,12 @@ print(f"  deactivated {n_dead} stale prims")
 
 print("[clean] muting per-asset env_lights and Grey_Studio DistantLight")
 muted, kept, ambient = mute_studio_and_per_asset_lights(stage)
+KEPT_LIGHTS = kept            # room lights -> per-frame color/exposure DR below
 print(f"  muted {len(muted)} lights")
-print(f"  kept {len(kept)} ceiling fixtures: {kept}")
+print(f"  kept {len(kept)} room lights (authored intensity): {kept}")
 print(f"  ambient fill at low intensity: {ambient}")
+if not KEPT_LIGHTS:
+    print("  WARNING: no top-level /World lights kept -> scene may render dark!")
 
 
 # ============================================================================
@@ -1330,22 +1341,30 @@ with rep.trigger.on_frame(num_frames=args.frames, rt_subframes=args.rt_subframes
             position=rep.distribution.sequence(camera_positions),
             look_at=rep.distribution.sequence(camera_targets),
         )
-    # Randomize the two ceiling RectLights independently each frame.
-    # Wide intensity band so some frames are dim (one fixture nearly off) and
-    # others are bright; color drawn from a 5-preset color-temperature set.
-    # NOTE: rep.distribution.uniform requires lower[i] <= upper[i] per channel,
-    # so any color randomization that crosses channels needs `choice`.
-    ceiling = rep.get.prims(path_pattern="/World/RectLight.*")
-    with ceiling:
-        rep.modify.attribute("intensity",
-                             rep.distribution.uniform(1500, 4000))
-        rep.modify.attribute("color", rep.distribution.choice([
-            (1.00, 0.85, 0.65),  # warm white (~2700 K, incandescent corridor)
-            (1.00, 0.93, 0.83),  # neutral warm (~3500 K, fluorescent)
-            (1.00, 0.97, 0.92),  # neutral white (~4000 K)
-            (0.95, 0.95, 0.95),  # cool white (~5000 K, LED panel)
-            (0.92, 0.94, 1.00),  # cool daylight (~5500 K, window mix)
-        ]))
+    # Per-frame lighting DR on the kept room lights (color TEMPERATURE +
+    # a gentle MULTIPLICATIVE intensity jitter around each light's authored
+    # value). We do NOT set an absolute intensity band: the kept fixtures span
+    # very different scales (e.g. SphereLight 500, DistantLight 2500, DiskLight
+    # 60000), so a fixed band would wash some out and blow others up. The
+    # `intensity_multiplier` attribute scales each light relative to its own
+    # authored intensity, which is scale-safe across fixture types.
+    if KEPT_LIGHTS:
+        import re as _re_l
+        ceiling = rep.get.prims(
+            path_pattern="(" + "|".join(_re_l.escape(p) for p in KEPT_LIGHTS) + ")$")
+        with ceiling:
+            # exposure is in STOPS: final intensity = intensity * 2**exposure,
+            # so this is a per-light multiplicative jitter (~0.62x .. 1.32x)
+            # that is correct regardless of each fixture's base intensity.
+            rep.modify.attribute("exposure",
+                                 rep.distribution.uniform(-0.7, 0.4))
+            rep.modify.attribute("color", rep.distribution.choice([
+                (1.00, 0.85, 0.65),  # warm white (~2700 K)
+                (1.00, 0.93, 0.83),  # neutral warm (~3500 K, fluorescent)
+                (1.00, 0.97, 0.92),  # neutral white (~4000 K)
+                (0.95, 0.95, 0.95),  # cool white (~5000 K, LED panel)
+                (0.92, 0.94, 1.00),  # cool daylight (~5500 K, window mix)
+            ]))
 
     # Independently vary the ambient dome light each frame. Brighter dome
     # mimics a sunlit window; darker dome mimics evening/night corridor.
