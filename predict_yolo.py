@@ -127,6 +127,19 @@ def main():
     print(f"[predict] {len(class_names)} classes")
 
     # ------------- load model + run inference -------------
+    # Domain-adaptation checkpoints are instances of train_yolo's custom
+    # SegmentationModel subclass, pickled under '__main__' (train_yolo ran as
+    # the main script). Alias those classes into THIS __main__ so torch.load
+    # can resolve them. Harmless for plain checkpoints.
+    try:
+        import __main__ as _main
+        import train_yolo as _ty
+        for _n in ("DomainAgnosticSegModel", "DomainAgnosticTrainer",
+                   "AlignSegmentationModel", "AlignSegmentationTrainer"):
+            if hasattr(_ty, _n):
+                setattr(_main, _n, getattr(_ty, _n))
+    except Exception as _e:
+        print(f"[predict] (note: could not alias DA model classes: {_e})")
     from ultralytics import YOLO
     print(f"[predict] loading {args.weights}")
     model = YOLO(str(args.weights))
@@ -147,6 +160,11 @@ def main():
     image_paths = sorted(images_dir.glob("*.jpg")) + sorted(images_dir.glob("*.png"))
     if not image_paths:
         sys.exit(f"no images under {images_dir}")
+    # Viz-only run (no --eval): only infer the images we'll actually draw, so
+    # we don't run (and hold) inference over the whole split -> far less GPU
+    # memory and time. --eval still needs the full split for COCO metrics.
+    if args.save_viz and not args.eval and args.max_viz:
+        image_paths = image_paths[:args.max_viz]
     print(f"[predict] running inference on {len(image_paths)} images")
 
     palette = _palette(len(class_names))

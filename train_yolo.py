@@ -120,27 +120,42 @@ def _rle_or_poly_to_binary_mask(seg, H: int, W: int) -> np.ndarray:
     return np.zeros((H, W), dtype=np.uint8)
 
 
-def _mask_to_yolo_polygon(mask: np.ndarray, W: int, H: int,
-                          eps_pct: float = 0.002) -> list[list[float]]:
+def _mask_to_one_polygon(mask: np.ndarray, W: int, H: int,
+                         eps_pct: float = 0.002) -> list[float] | None:
+    """Return ONE normalized flat polygon [x1,y1,...] for the WHOLE mask of a
+    single COCO instance. A disjoint mask (e.g. an occluded object split into
+    several blobs) is stitched into one polygon via Ultralytics'
+    merge_multi_segment so one instance stays ONE YOLO instance -- otherwise
+    each blob becomes a separate fake instance and the detector is trained to
+    fragment occluded objects. Returns None if the mask is too small."""
     if mask.sum() < 4:
-        return []
+        return None
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    polys = []
+    segs = []                                   # pixel-space (n,2) contours
     for c in cnts:
         if len(c) < 3:
             continue
         peri = cv2.arcLength(c, True)
         if peri <= 0:
             continue
-        approx = cv2.approxPolyDP(c, eps_pct * peri, True)
-        if len(approx) < 3:
-            continue
-        flat = []
-        for pt in approx.reshape(-1, 2):
-            flat.append(min(max(float(pt[0]) / W, 0.0), 1.0))
-            flat.append(min(max(float(pt[1]) / H, 0.0), 1.0))
-        polys.append(flat)
-    return polys
+        approx = cv2.approxPolyDP(c, eps_pct * peri, True).reshape(-1, 2)
+        if len(approx) >= 3:
+            segs.append(approx.astype(np.float64))
+    if not segs:
+        return None
+    if len(segs) == 1:
+        merged = segs[0]
+    else:
+        try:
+            from ultralytics.data.converter import merge_multi_segment
+            merged = np.concatenate(merge_multi_segment(segs), axis=0)
+        except Exception:
+            merged = max(segs, key=len)         # fallback: keep the largest blob
+    flat = []
+    for x, y in merged:
+        flat.append(min(max(float(x) / W, 0.0), 1.0))
+        flat.append(min(max(float(y) / H, 0.0), 1.0))
+    return flat
 
 
 def convert_split_to_yolo(split_dir: Path, cat_id_to_yolo: dict,
@@ -178,15 +193,15 @@ def convert_split_to_yolo(split_dir: Path, cat_id_to_yolo: dict,
             if cat_id not in cat_id_to_yolo:
                 n_dropped += 1
                 continue
-            polys = _mask_to_yolo_polygon(
+            # ONE polygon (one line) per COCO annotation -> 1 instance = 1 instance
+            poly = _mask_to_one_polygon(
                 _rle_or_poly_to_binary_mask(ann.get("segmentation", []), H, W), W, H)
-            if not polys:
+            if poly is None:
                 n_dropped += 1
                 continue
-            for poly in polys:
-                lines.append(f"{cat_id_to_yolo[cat_id]} "
-                             + " ".join(f"{c:.6f}" for c in poly))
-                n_written += 1
+            lines.append(f"{cat_id_to_yolo[cat_id]} "
+                         + " ".join(f"{c:.6f}" for c in poly))
+            n_written += 1
         label_path.write_text("\n".join(lines) + ("\n" if lines else ""))
     return len(coco["images"]), n_written, n_dropped
 
