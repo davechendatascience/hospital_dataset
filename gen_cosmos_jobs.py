@@ -68,12 +68,14 @@ def _humanize(name: str) -> str:
     return " ".join(_ACRONYM.get(w, w) for w in name.split("_"))
 
 
-def build_prompt(class_names: set) -> str:
-    """Scene-agnostic framing + the ACTUAL objects in this frame (from COCO labels)."""
-    objs = sorted(_humanize(n) for n in class_names if n and n != "ward_object")
-    obj_str = ", ".join(objs) if objs else "hospital equipment"
-    return (f"A realistic photograph of a Taiwanese hospital interior, with "
-            f"{obj_str}; {SHARED_MATERIALS}.")
+def build_prompt(class_names=None) -> str:
+    """Scene-level framing + materials ONLY -- deliberately does NOT enumerate
+    the objects. The seg control already specifies what objects exist and
+    where; naming the classes in the prompt invites Cosmos to paint extra or
+    duplicated instances of them into the unlabeled background. (class_names is
+    accepted for call-site compatibility but unused.)"""
+    return (f"A realistic photograph of a Taiwanese hospital interior; "
+            f"{SHARED_MATERIALS}.")
 
 
 def list_images(d: Path):
@@ -89,9 +91,12 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sim-dir", type=Path, default=PROJECT / "ward_v3/train/images")
     ap.add_argument("--out", type=Path, default=PROJECT / "cosmos_jobs")
-    ap.add_argument("--seg-weight", type=float, default=0.6,
+    ap.add_argument("--seg-weight", type=float, default=0.8,
                     help="seg (label) control weight; feeds the class-id seg map rasterized "
-                         "from the sim COCO -> preserves object regions on the output.")
+                         "from the sim COCO -> preserves object regions on the output. Raised "
+                         "to 0.8 (from 0.6): tighter adherence to the label map so Cosmos "
+                         "keeps objects in their seg regions and the black background stays "
+                         "object-free (paired with dropping objects from the prompt).")
     ap.add_argument("--depth-weight", type=float, default=0.8,
                     help="depth control weight; feeds ground-truth Isaac depth -> geometry. "
                          "Set 0 to disable depth control.")
