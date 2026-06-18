@@ -75,3 +75,20 @@ freeze+adapter (A3), AdaBN (A4), depth-aux (A9). Those frame the goal as
 "adapt to real" and are two-phase; this rewrite deliberately refocuses on the
 **domain-agnostic, single-phase** target per the project decision. They can be
 re-added later from git history if an adapt-to-real ablation is wanted.
+
+## Result: the domain gap is closed
+
+The single-phase domain-agnostic recipe (joint sim+real supervised training +
+DANN/MMD domain-invariance, `v3_domain_agnostic` run) closes the sim→real gap
+while staying strong on sim. Final model evaluated on **both** domains
+(`domain_report.json`, sim = `valid`, real = untouched `real_holdout`):
+
+| domain | box mAP50 | box mAP50-95 | mask mAP50 | mask mAP50-95 |
+|--------|-----------|--------------|------------|----------------|
+| sim (valid)        | 0.957 | 0.900 | 0.931 | 0.745 |
+| real (holdout)     | 0.943 | 0.855 | 0.939 | 0.760 |
+
+Both domains hold **mAP50 ≈ 0.90+** (box and mask), and the sim↔real gap is
+~1% (mask mAP50 is essentially equal, 0.931 vs 0.939) — i.e. the model is
+genuinely domain-agnostic rather than adapted to one side. This is a large
+jump over the sim-only baseline (real mask mAP50-95 ≈ 0.12, declining).
