@@ -159,16 +159,17 @@ DINOv2/CLIP 空間的無偏 MMD² 與平衡分類器雙樣本探針（見 `docs/
 
 ### 4. 用 Cosmos‑Transfer2.5 做 sim → real 風格轉換
 ```bash
-.venv/bin/python gen_cosmos_jobs.py --sim-dir ward_data/ward_dataset_v3/train \
+.venv/bin/python gen_cosmos_jobs.py --sim-dir ward_data/ward_dataset_v3/train/images \
     --test-dir ward_data/ward_dataset_v3/test --out cosmos_jobs_v3 --vary-style
 nohup bash cosmos_jobs_v3/run_all.sh > ~/cosmos_batch.log 2>&1 &   # 可續跑，跳過已完成影格
 ```
 **配方**（`gen_cosmos_jobs.py` 預設）：
-- **Controls：** `seg 0.6`（類別 id 圖→物件區域）+ `depth 0.8`（GT 幾何）+ `edge 1.0`（輪廓，即時）。
-  不用 `vis`（vis 會保留模擬的顏色/材質）。
+- **Controls：** `seg 0.8`（類別 id 圖→物件區域；由 0.6 提高以更嚴格貼合標註圖、抑制背景亂長物件）
+  + `depth 0.8`（GT 幾何）+ `edge 1.0`（輪廓，即時）。不用 `vis`（vis 會保留模擬的顏色/材質）。
 - **Guided generation：** 前景遮罩（物件遮罩聯集）錨定有標註物件；
   `guided_generation_step_threshold ≈ 10`（整數步數，約 35 步中的前 10 步先錨定結構，之後放開讓它擬真重繪）。
-- **Prompt：** 場景無關，列出該影格**實際**的物件類別（取自 COCO 標註；不需脆弱的病房/走廊/浴室分類器）。
+- **Prompt：** 場景層級框架 + 共用材質，**刻意不列出物件類別**（seg 控制已指定有哪些物件與其位置；
+  在 prompt 中列出類別會誘使模型把更多同類物件畫進未標註的背景）。風格參考仍用物件清單比對。
 - **Style ref（`image_context_path`）：** 物件清單與該影格最相近（Jaccard）的真實照片；
   `--vary-style` 會在前幾名中抽樣並變化 seed 與光照。
 - **`guidance` 3**（適中，避免壓過結構）。

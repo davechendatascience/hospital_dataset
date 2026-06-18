@@ -20,6 +20,7 @@ import csv
 import json
 import os
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -134,7 +135,17 @@ def main():
     ap.add_argument("--device", default="0")
     args = ap.parse_args()
 
+    # build_dataset leaves images in the split ROOT, but a YOLO conversion later
+    # moves them into <split>/images. Auto-descend so --sim-dir <split> still
+    # works after that move (otherwise it globs 0 images -> empty configs).
+    if not list_images(args.sim_dir) and (args.sim_dir / "images").is_dir():
+        print(f"[cosmos-jobs] {args.sim_dir} has no images; using "
+              f"{args.sim_dir/'images'}")
+        args.sim_dir = args.sim_dir / "images"
     sim_files = list_images(args.sim_dir)
+    if not sim_files:
+        sys.exit(f"[cosmos-jobs] no images under {args.sim_dir} "
+                 f"(nor {args.sim_dir/'images'}) -- nothing to do.")
     if args.limit:
         sim_files = sim_files[:args.limit]
     # Scene is NOT classified here -- the seg+depth controls + the guided foreground
