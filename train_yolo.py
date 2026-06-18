@@ -60,7 +60,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch",  type=int, default=16)
     p.add_argument("--device", default="0")
     p.add_argument("--workers", type=int, default=8)
-    p.add_argument("--project", default="runs/segment")
+    p.add_argument("--project", default=str(PROJECT_ROOT / "runs" / "segment"),
+                   help="Run output dir. Absolute by default (this repo's "
+                        "runs/segment) so it ignores Ultralytics' global "
+                        "runs_dir setting; pass a relative path to use that.")
     p.add_argument("--name", default=None)
     p.add_argument("--rebuild-labels", action="store_true",
                    help="Force re-conversion of COCO -> YOLO labels.")
