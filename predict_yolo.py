@@ -51,6 +51,10 @@ def parse_args():
                    help="NMS IoU threshold")
     p.add_argument("--device", default="0",
                    help="GPU id, 'cpu', or comma-list")
+    p.add_argument("--predict-batch", type=int, default=8,
+                   help="Images per inference chunk; GPU cache is freed between "
+                        "chunks so peak memory is bounded (lower this if you "
+                        "still OOM while a training shares the GPU).")
     p.add_argument("--save-viz", action="store_true",
                    help="Save annotated visualization JPG per test image")
     p.add_argument("--max-viz", type=int, default=None,
@@ -171,66 +175,69 @@ def main():
     coco_predictions = []
     n_viz = 0
 
-    results = model.predict(
-        source=[str(p) for p in image_paths],
-        imgsz=args.imgsz,
-        conf=args.conf,
-        iou=args.iou,
-        device=args.device,
-        retina_masks=True,   # mask resampled to native image resolution
-        verbose=False,
-        stream=True,
-    )
-
-    # Ultralytics stream yields results in input order; zip with original paths
-    # because r.path can be auto-renamed (e.g. "image723.jpg") and won't match
-    # the COCO GT file_names.
-    for img_path, r in zip(image_paths, results):
-        fname = img_path.name
-        if fname not in fname_to_id:
-            print(f"  [warn] no GT entry for {fname}; skipping")
-            continue
-        image_id = fname_to_id[fname]
-        H, W     = r.orig_shape
-
-        if r.boxes is None or len(r.boxes) == 0:
-            continue
-        boxes_xyxy = r.boxes.xyxy.cpu().numpy()        # (N, 4)
-        scores     = r.boxes.conf.cpu().numpy()        # (N,)
-        cls_ids    = r.boxes.cls.cpu().numpy().astype(int)
-
-        if r.masks is not None:
-            masks = r.masks.data.cpu().numpy().astype(bool)  # (N, H, W)
-        else:
-            masks = np.zeros((len(boxes_xyxy), H, W), dtype=bool)
-
-        for i in range(len(boxes_xyxy)):
-            cid    = int(cls_ids[i])
-            if cid < 0 or cid >= len(yolo_to_cat_id):
+    # Process in small CHUNKS, freeing GPU memory between them, so peak usage
+    # is bounded by one chunk regardless of split size. (stream=True alone
+    # still accumulated enough across a 1500-image split to OOM when the GPU is
+    # shared with a training run.) Each result's tensors are pulled to CPU
+    # immediately and the chunk's GPU cache is released before the next chunk.
+    import torch
+    chunk = max(1, args.predict_batch)
+    for ci in range(0, len(image_paths), chunk):
+        batch_paths = image_paths[ci:ci + chunk]
+        results = model.predict(
+            source=[str(p) for p in batch_paths],
+            imgsz=args.imgsz, conf=args.conf, iou=args.iou,
+            device=args.device, retina_masks=True, verbose=False, stream=True,
+        )
+        for img_path, r in zip(batch_paths, results):
+            fname = img_path.name
+            if fname not in fname_to_id:
+                print(f"  [warn] no GT entry for {fname}; skipping")
                 continue
-            cat_id = yolo_to_cat_id[cid]
-            x1, y1, x2, y2 = [float(v) for v in boxes_xyxy[i]]
-            w, h = x2 - x1, y2 - y1
-            entry = {
-                "image_id":    image_id,
-                "category_id": cat_id,
-                "bbox":        [x1, y1, w, h],
-                "score":       float(scores[i]),
-            }
-            if masks[i].any():
-                entry["segmentation"] = _mask_to_rle(masks[i])
-            coco_predictions.append(entry)
+            image_id = fname_to_id[fname]
+            H, W     = r.orig_shape
 
-        if viz_dir is not None and (args.max_viz is None or n_viz < args.max_viz):
-            img_bgr = cv2.imread(str(img_path))
-            if img_bgr is not None:
-                drawn = _draw_predictions(
-                    img_bgr, boxes_xyxy, masks, cls_ids, scores,
-                    class_names, palette,
-                )
-                out_path = viz_dir / (img_path.stem + "_pred.jpg")
-                cv2.imwrite(str(out_path), drawn, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                n_viz += 1
+            if r.boxes is None or len(r.boxes) == 0:
+                continue
+            boxes_xyxy = r.boxes.xyxy.cpu().numpy()        # (N, 4)
+            scores     = r.boxes.conf.cpu().numpy()        # (N,)
+            cls_ids    = r.boxes.cls.cpu().numpy().astype(int)
+
+            if r.masks is not None:
+                masks = r.masks.data.cpu().numpy().astype(bool)  # (N, H, W)
+            else:
+                masks = np.zeros((len(boxes_xyxy), H, W), dtype=bool)
+
+            for i in range(len(boxes_xyxy)):
+                cid    = int(cls_ids[i])
+                if cid < 0 or cid >= len(yolo_to_cat_id):
+                    continue
+                cat_id = yolo_to_cat_id[cid]
+                x1, y1, x2, y2 = [float(v) for v in boxes_xyxy[i]]
+                w, h = x2 - x1, y2 - y1
+                entry = {
+                    "image_id":    image_id,
+                    "category_id": cat_id,
+                    "bbox":        [x1, y1, w, h],
+                    "score":       float(scores[i]),
+                }
+                if masks[i].any():
+                    entry["segmentation"] = _mask_to_rle(masks[i])
+                coco_predictions.append(entry)
+
+            if viz_dir is not None and (args.max_viz is None or n_viz < args.max_viz):
+                img_bgr = cv2.imread(str(img_path))
+                if img_bgr is not None:
+                    drawn = _draw_predictions(
+                        img_bgr, boxes_xyxy, masks, cls_ids, scores,
+                        class_names, palette,
+                    )
+                    out_path = viz_dir / (img_path.stem + "_pred.jpg")
+                    cv2.imwrite(str(out_path), drawn, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                    n_viz += 1
+        del results
+        if str(args.device) != "cpu" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     pred_path = out_dir / "predictions.coco.json"
     with open(pred_path, "w") as f:
