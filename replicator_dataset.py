@@ -140,7 +140,7 @@ from pxr import Usd, UsdGeom, UsdLux, Sdf, Gf         # noqa: E402
 # Load your taxonomy so the same class names are used everywhere.
 sys.path.insert(0, str(PROJECT_ROOT / "ROS2_bridge" / "src"))
 from fixed_categories import (                        # noqa: E402
-    FIXED_CATEGORIES, normalize_label, class_from_entry)
+    FIXED_CATEGORIES, normalize_label, class_from_entry, supercategory_of)
 
 random.seed(args.seed)
 np.random.seed(args.seed)
@@ -1522,7 +1522,7 @@ def basic_writer_to_coco(raw_dir: Path, out_root: Path, tag: str,
         "images": [],
         "annotations": [],
         "categories": [
-            {"id": cid, "name": name, "supercategory": "ward_object"}
+            {"id": cid, "name": name, "supercategory": supercategory_of(name)}
             for name, cid in category_map.items()
         ],
     }

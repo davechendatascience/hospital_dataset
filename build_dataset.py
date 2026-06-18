@@ -47,7 +47,7 @@ from pycocotools import mask as coco_mask
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / "ROS2_bridge" / "src"))
 from fixed_categories import (  # type: ignore  # noqa: E402
-    FIXED_CATEGORIES, class_from_entry)
+    FIXED_CATEGORIES, class_from_entry, supercategory_of)
 
 DEFAULT_STAGE          = PROJECT_ROOT / "Collected_Ward0505" / "Ward0505.usd"
 DEFAULT_REAL_TEST_ROOT = PROJECT_ROOT / "Ward_dataset0518"
@@ -626,7 +626,7 @@ def convert_raw_to_coco(raw_dir: Path, split_dir: Path,
         "info": {"description": f"Ward replicator dataset split={split_dir.name}"},
         "images": [], "annotations": [],
         "categories": [
-            {"id": cid, "name": name, "supercategory": "ward_object"}
+            {"id": cid, "name": name, "supercategory": supercategory_of(name)}
             for name, cid in category_map.items()
         ],
     }
@@ -752,7 +752,7 @@ def build_test_from_real(real_root: Path, dst_dir: Path,
         "info": {"description": "Ward real test (remapped category ids)"},
         "images": [], "annotations": [],
         "categories": [
-            {"id": cid, "name": name, "supercategory": "ward_object"}
+            {"id": cid, "name": name, "supercategory": supercategory_of(name)}
             for name, cid in category_map.items()
         ],
     }

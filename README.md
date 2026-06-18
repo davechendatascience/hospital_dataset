@@ -129,7 +129,31 @@ cosmos_jobs_v3/
   outputs/  風格化結果 <stem>.jpg    run_all.sh  manifest.csv
 ```
 
-類別：44 個病房類別，定義於 `ROS2_bridge/src/fixed_categories.py`。
+類別：43 個病房物件類別（+ `ward_object` 背景超類別 id 0），定義於
+`ROS2_bridge/src/fixed_categories.py`。
+
+### 類別階層（supercategory 樹）
+
+COCO 的 `categories[].supercategory` 欄位用來表達兩層的類別階層：43 個葉類別
+歸入 8 個 supercategory。標準 COCO 評估仍以葉類別計分，但 supercategory 記錄了
+分組關係（例如同一家具群、或做粗粒度分析）。樹定義於 `fixed_categories.py` 的
+`SUPERCATEGORY_TREE`（`supercategory_of(name)` 為查詢函式），`build_dataset.py` 與
+`replicator_dataset.py` 產生 COCO 標註時即套用。
+
+| supercategory（超類別） | 葉類別 |
+|---|---|
+| **furniture**（家具） | hospital_bed, bedside_table, overbed_table, companion_chair, stool, cabinet |
+| **medical_equipment**（醫療設備） | bedside_monitor, oxygen_flowmeter, gas_manifold, iv_pole, suction_jar, suction_knob, scale, weight_scale, stethoscope, ear_thermometer |
+| **consumable**（耗材／用品） | alcohol_spray_bottle, sanitizer, gauze, medical_gloves, medical_package, syringe, paperbox, tissue_dispenser |
+| **waste_container**（廢棄物容器） | waste_bin, medical_waste_container, soiled_linen_bin |
+| **bathroom_fixture**（衛浴設備） | toilet, toilet_handle, sink, shower |
+| **structure_fixture**（建築結構與固定件） | door, door_handle, window, mirror, light_switch, air_vent, hook |
+| **textile**（布類／隔簾） | curtain, bed_curtain |
+| **electronics**（電子裝置） | TV, telephone, remote_control |
+
+調整分組只需改 `SUPERCATEGORY_TREE` 一處；其餘（每類別查詢、資料集建構）皆由它衍生。
+（註：`cabinet_door`、`handle` 等屬於櫃體零件的標籤目前不在分類中——它們在標註轉換時被
+丟棄，且真實資料的對應標註已無法復原，因此暫不納入此樹。）
 
 ## 流程
 
