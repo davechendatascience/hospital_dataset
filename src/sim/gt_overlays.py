@@ -17,7 +17,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 from pycocotools.coco import COCO
 
-PROJECT = Path(__file__).resolve().parent
+PROJECT = Path(__file__).resolve().parents[2]
 
 
 def render_split(split_dir: Path, out_dir: Path, n: int, seed: int) -> int:

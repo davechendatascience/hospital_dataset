@@ -14,9 +14,9 @@ from pathlib import Path
 
 from pxr import Usd, UsdGeom, Gf
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(PROJECT_ROOT / "ROS2_bridge" / "src"))
-from fixed_categories import FIXED_CATEGORIES  # noqa: E402
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from common.categories import FIXED_CATEGORIES  # noqa: E402
 
 STAGE = str(PROJECT_ROOT / "Collected_Ward0505" / "Ward0505.usd")
 SEED = 42

@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw
 
 import train_seg_detr as T
 
-PROJECT = Path(__file__).resolve().parent
+PROJECT = Path(__file__).resolve().parents[2]
 
 
 def build(args):

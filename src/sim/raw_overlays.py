@@ -19,9 +19,9 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 
-PROJECT = Path(__file__).resolve().parent
-sys.path.insert(0, str(PROJECT / "ROS2_bridge" / "src"))
-from fixed_categories import class_from_entry  # noqa: E402
+PROJECT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT / "src"))
+from common.categories import class_from_entry  # noqa: E402
 
 
 def overlay_frame(rgb_path: Path, dst: Path) -> int:

@@ -1,0 +1,49 @@
+{
+  "floor_z": 0.0,
+  "rooms": [
+    {"name": "Ward", "xmin": 0.0, "xmax": 5.0, "ymin": 0.0, "ymax": 6.0},
+    {"name": "Bathroom", "xmin": 5.0, "xmax": 7.5, "ymin": 0.0, "ymax": 3.0}
+  ],
+  "slots": [
+    {"id": "bay_a", "type": "bay", "room": "Ward", "edge": ["x", "min"], "t": 0.25,
+     "bed": "hospital_bed",
+     "satellites": [
+       {"class": "overbed_table", "drun": 0.0, "dperp": 0.7, "z": 0.0},
+       {"class": "bedside_table", "drun": -0.7, "dperp": 0.0, "z": 0.0},
+       {"class": "iv_pole", "drun": 0.7, "dperp": 0.15, "z": 0.0}
+     ]},
+    {"id": "bay_b", "type": "bay", "room": "Ward", "edge": ["x", "min"], "t": 0.7,
+     "bed": "hospital_bed",
+     "satellites": [
+       {"class": "overbed_table", "drun": 0.0, "dperp": 0.7, "z": 0.0},
+       {"class": "iv_pole", "drun": 0.7, "dperp": 0.15, "z": 0.0}
+     ]},
+    {"id": "mon_a", "type": "wall", "room": "Ward", "edge": ["x", "min"], "t": 0.25,
+     "z": 1.35, "class": "bedside_monitor"},
+    {"id": "gas_a", "type": "wall", "room": "Ward", "edge": ["x", "min"], "t": 0.32,
+     "z": 1.45, "class": "gas_manifold"},
+    {"id": "mon_b", "type": "wall", "room": "Ward", "edge": ["x", "min"], "t": 0.7,
+     "z": 1.35, "class": "bedside_monitor"},
+    {"id": "chair_a", "type": "floor", "room": "Ward",
+     "rect": [3.0, 0.5, 4.7, 5.5], "class": "companion_chair"},
+    {"id": "bin_a", "type": "floor", "room": "Ward",
+     "rect": [3.5, 0.3, 4.8, 2.0], "class": "waste_bin"},
+    {"id": "linen_a", "type": "floor", "room": "Ward",
+     "rect": [3.5, 4.0, 4.8, 5.7], "class": "soiled_linen_bin"},
+    {"id": "remote_a", "type": "surface", "on": "bay_a/overbed_table", "class": "remote_control"},
+    {"id": "pkg_a", "type": "surface", "on": "bay_a/overbed_table", "class": "medical_package"}
+  ],
+  "assets": {
+    "hospital_bed": [{"usd": "assets/bed.usd", "size": [2.05, 0.95, 0.62]}],
+    "overbed_table": [{"usd": "assets/overbed_table.usd", "size": [0.75, 0.45, 0.95]}],
+    "bedside_table": [{"usd": "assets/bedside_table.usd", "size": [0.45, 0.45, 0.7]}],
+    "iv_pole": [{"usd": "assets/iv_pole.usd", "size": [0.4, 0.4, 1.8]}],
+    "bedside_monitor": [{"usd": "assets/monitor.usd", "size": [0.35, 0.3, 0.35]}],
+    "gas_manifold": [{"usd": "assets/gas_manifold.usd", "size": [0.5, 0.15, 0.3]}],
+    "companion_chair": [{"usd": "assets/chair.usd", "size": [0.6, 0.6, 0.95]}],
+    "waste_bin": [{"usd": "assets/waste_bin.usd", "size": [0.35, 0.35, 0.55]}],
+    "soiled_linen_bin": [{"usd": "assets/linen_bin.usd", "size": [0.5, 0.5, 0.8]}],
+    "remote_control": [{"usd": "assets/remote.usd", "size": [0.05, 0.18, 0.03]}],
+    "medical_package": [{"usd": "assets/package.usd", "size": [0.2, 0.15, 0.08]}]
+  }
+}

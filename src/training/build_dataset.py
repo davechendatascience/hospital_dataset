@@ -44,9 +44,9 @@ import numpy as np
 from PIL import Image
 from pycocotools import mask as coco_mask
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(PROJECT_ROOT / "ROS2_bridge" / "src"))
-from fixed_categories import (  # type: ignore  # noqa: E402
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from common.categories import (  # type: ignore  # noqa: E402
     FIXED_CATEGORIES, class_from_entry, supercategory_of)
 
 DEFAULT_STAGE          = PROJECT_ROOT / "Collected_Ward0505" / "Ward0505.usd"

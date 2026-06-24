@@ -96,6 +96,32 @@ def _rect_shift(r, dx, dy):
     return [r[0] + dx, r[1] + dy, r[2] + dx, r[3] + dy]
 
 
+def _seg_rect(p0, p1, rect, margin=0.0):
+    """Liang-Barsky: does the XY segment p0->p1 intersect the AABB rect
+    [xmin, ymin, xmax, ymax]? Used to keep a re-placed item on its own side of
+    the walls (a move whose path crosses a wall would land in another room)."""
+    xmin, ymin = rect[0] - margin, rect[1] - margin
+    xmax, ymax = rect[2] + margin, rect[3] + margin
+    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, p0[0] - xmin), (dx, xmax - p0[0]),
+                 (-dy, p0[1] - ymin), (dy, ymax - p0[1])):
+        if abs(p) < 1e-12:
+            if q < 0:
+                return False          # parallel and outside this slab
+        else:
+            r = q / p
+            if p < 0:
+                if r > t1:
+                    return False
+                t0 = max(t0, r)
+            else:
+                if r < t0:
+                    return False
+                t1 = min(t1, r)
+    return t0 <= t1
+
+
 def _blk_shift(b, dx, dy):
     return (_rect_shift(b[0], dx, dy), b[1], b[2])
 
@@ -139,6 +165,32 @@ def _nearest_edge(room, aabb):
     ]
     dist, edge = min(cands, key=lambda c: c[0])
     return edge, ("y" if edge[0] == "x" else "x"), dist
+
+
+def _wall_run_extent(group, wall_boxes, obj_by_path):
+    """The run-axis (slide-direction) span of the real wall mesh a wall group is
+    attached to. -> (lo, hi) or None if no walls / none match. Picks the wall
+    mesh that straddles the group's pinned coordinate and overlaps its run
+    interval, nearest in the pinned axis."""
+    if not wall_boxes:
+        return None
+    edge, run = group["key"][1], group["key"][2]
+    pin_i = 0 if edge[0] == "x" else 1
+    run_i = 0 if run == "x" else 1
+    members = [obj_by_path[p]["aabb"] for p in group["members"]]
+    pin_c = 0.5 * (min(a[0][pin_i] for a in members) +
+                   max(a[1][pin_i] for a in members))
+    run_lo, run_hi = group["iv"]
+    best, best_d = None, 1e9
+    for (mn, mx) in wall_boxes:
+        if not (mn[pin_i] - 0.4 <= pin_c <= mx[pin_i] + 0.4):
+            continue                      # wall doesn't pass through the group
+        if mx[run_i] < run_lo - 0.1 or mn[run_i] > run_hi + 0.1:
+            continue                      # wall doesn't span the group's run
+        d = abs(0.5 * (mn[pin_i] + mx[pin_i]) - pin_c)
+        if d < best_d:
+            best_d, best = d, (float(mn[run_i]), float(mx[run_i]))
+    return best
 
 
 def _find_support(item, candidates):
@@ -204,7 +256,13 @@ def _build_ctx(object_targets, rooms, floor_z, max_shift=0.8, wall_slide=0.2,
     obj_by_path = {o["path"]: o for o in objs}
     pos0 = {o["path"]: tuple(o["translate"]) for o in objs}
 
-    # ---- role resolution (class + geometry; unknown/unsure -> fixture) ----
+    # ---- role resolution: the support mode is DECLARED, not guessed from z ----
+    # Each object's support comes from its per-instance `affordance` (set by the
+    # dump from the authored scene) or, failing that, the explicit class table in
+    # placement_affordances. The old z-threshold guess misread low wall gear as
+    # floor; support is now authoritative. "floor" support is then refined into
+    # bed / satellite / floor for MOTION grouping (a bay slides as a unit).
+    from layout import affordances as _paff
     beds = [o for o in objs
             if o["class"] in BED_CLASSES and o.get("room") in by_room]
     supports = [o for o in objs
@@ -213,35 +271,38 @@ def _build_ctx(object_targets, rooms, floor_z, max_shift=0.8, wall_slide=0.2,
     roles, support_of = {}, {}
     for o in objs:
         path, cls = o["path"], o["class"]
-        zb = o["aabb"][0][2] - floor_z
         if o.get("room") not in by_room:
+            roles[path] = "fixture"
+            continue
+        support = o.get("affordance") or _paff.support_of(cls)
+        if support == "fixed":
+            roles[path] = "fixture"
+            continue
+        if support == "wall":
+            roles[path] = "wall"
+            continue
+        if support == "surface":
+            sup = _find_support(o, supports)
+            roles[path] = "surface" if sup is not None else "floor"
+            if sup is not None:
+                support_of[path] = sup["path"]
+            continue
+        # support == "floor": refine into bed / satellite / floor.
+        # A SURFACE-class item declared 'floor' but sitting ELEVATED actually
+        # rests on a surface the dump couldn't detect (an unmodeled counter /
+        # shelf); keep it put rather than dropping it to the floor or sliding it.
+        if _paff.support_of(cls) == "surface" and \
+           (o["aabb"][0][2] - floor_z) > _ELEVATED:
             roles[path] = "fixture"
             continue
         if cls in BED_CLASSES:
             roles[path] = "bed"
             continue
-        if cls in SURFACE_CLASSES:
-            sup = _find_support(o, supports)
-            if sup is not None:
-                roles[path] = "surface"
-                support_of[path] = sup["path"]
-                continue
-        if cls in SATELLITE_CLASSES:
-            roles[path] = ("satellite"
-                           if any(_near(o, b, 2.0) and b.get("room") == o.get("room")
-                                  for b in beds) else "floor")
-            continue
-        if cls == "iv_pole" and any(_near(o, b, 1.5) and
-                                    b.get("room") == o.get("room") for b in beds):
+        if (cls in SATELLITE_CLASSES or cls == "iv_pole") and \
+           any(_near(o, b, 2.0) and b.get("room") == o.get("room") for b in beds):
             roles[path] = "satellite"
             continue
-        if cls in WALL_CLASSES and zb > _ELEVATED:
-            roles[path] = "wall"
-            continue
-        if cls in (FLOOR_CLASSES | WALL_CLASSES):
-            roles[path] = "floor" if zb <= _ELEVATED else "fixture"
-            continue
-        roles[path] = "fixture"
+        roles[path] = "floor"
 
     # satellites attach to their nearest bed
     sat_bed = {}
@@ -255,20 +316,27 @@ def _build_ctx(object_targets, rooms, floor_z, max_shift=0.8, wall_slide=0.2,
         b = min(cands, key=lambda b: _xy_gap(o["aabb"], b["aabb"]))
         sat_bed[o["path"]] = b["path"]
 
-    # ---- wall groups: attached components per (room, edge) wall ----
-    wall_key = {}
+    # ---- wall groups: CONNECTED clusters first, then ONE wall per cluster ----
+    # Keying by nearest edge BEFORE clustering splits a unit that straddles a
+    # corner: a suction jar + knob 13 cm apart can land on different edges and
+    # then slide INTO each other (they're attached in reality). Clustering by
+    # connectivity first, then choosing one edge for the whole cluster's union
+    # AABB, keeps such a unit a single rigid group.
+    wall_by_room = defaultdict(list)
     for o in objs:
         if roles[o["path"]] == "wall":
-            edge, axis, _ = _nearest_edge(by_room[o["room"]], o["aabb"])
-            wall_key[o["path"]] = (o["room"], edge, axis)
-    by_key = defaultdict(list)
-    for o in objs:
-        if o["path"] in wall_key:
-            by_key[wall_key[o["path"]]].append(o)
+            wall_by_room[o["room"]].append(o)
     wall_groups = []
-    for key, items in by_key.items():
+    for rname, items in wall_by_room.items():
+        room = by_room[rname]
         for members in _components(items, link_gap):
-            axis = key[2]
+            # the wall is set by the cluster's DOMINANT (largest-footprint)
+            # member -- a union AABB of an elongated cluster can read closer to a
+            # perpendicular wall and flip the whole group onto the wrong one.
+            dom = max(members, key=lambda m: (m["aabb"][1][0] - m["aabb"][0][0]) *
+                      (m["aabb"][1][1] - m["aabb"][0][1]))
+            edge, axis, _ = _nearest_edge(room, dom["aabb"])
+            key = (rname, edge, axis)
             iv = (min(_interval(m["aabb"], axis)[0] for m in members),
                   max(_interval(m["aabb"], axis)[1] for m in members))
             z0 = min(m["aabb"][0][2] for m in members)
@@ -276,6 +344,12 @@ def _build_ctx(object_targets, rooms, floor_z, max_shift=0.8, wall_slide=0.2,
             wall_groups.append({"key": key, "iv": iv, "z": (z0, z1),
                                 "in_bay": False,
                                 "members": [m["path"] for m in members]})
+
+    # real-wall extent per group: the run-axis span of the actual wall mesh the
+    # group is against, so wall items randomize ALONG THEIR REAL WALL (not the
+    # centroid-room edge, which can run past the wall into a corner / doorway).
+    for g in wall_groups:
+        g["wall_span"] = _wall_run_extent(g, wall_boxes, obj_by_path)
 
     # ---- bed bays: bed + satellites + overhead wall groups, 1D along wall --
     bays = []
@@ -436,6 +510,27 @@ def _build_ctx(object_targets, rooms, floor_z, max_shift=0.8, wall_slide=0.2,
     for o in surface_items:
         riders_of[support_of[o["path"]]].append(o)
 
+    # candidate hosts for PLACEMENT RANDOMIZATION of surface items, from the
+    # host-equivalence classes (paperbox -> on bed | bedside_table | overbed_
+    # table). A host is ("on", host_path) or ("floor", room). Falls back to the
+    # geometrically-detected support if the class declares no host group.
+    from layout import affordances as _paff
+    hosts_by_class = defaultdict(list)
+    for o in objs:
+        if _paff.provides_surface(o["class"]):
+            hosts_by_class[o["class"]].append(o["path"])
+    surface_hosts = {}
+    for o in surface_items:
+        cands = []
+        for kind, sel in _paff.host_specs_for(o["class"]):
+            if kind == "on":
+                cands += [("on", hp) for hp in hosts_by_class.get(sel, [])]
+            elif kind == "floor" and (sel in by_room or sel == "*"):
+                cands.append(("floor", sel))
+        if not cands and o["path"] in support_of:
+            cands = [("on", support_of[o["path"]])]
+        surface_hosts[o["path"]] = cands
+
     return {
         "objs": objs, "by_room": by_room, "obj_by_path": obj_by_path,
         "pos0": pos0, "roles": roles, "support_of": support_of,
@@ -445,7 +540,7 @@ def _build_ctx(object_targets, rooms, floor_z, max_shift=0.8, wall_slide=0.2,
         "bay_walls": bay_walls, "floor_walls": floor_walls,
         "wb_blks": wb_blks, "floor_wall_exempt": floor_wall_exempt,
         "floor_gf": floor_gf,
-        "riders_of": riders_of,
+        "riders_of": riders_of, "surface_hosts": surface_hosts,
         "max_shift": max_shift, "wall_slide": wall_slide,
         "sat_slide": sat_slide, "global_frac": global_frac,
     }
@@ -598,7 +693,11 @@ def _solve(ctx, rng, attempts=40, params=None):
             continue
         key = g["key"]
         room = by_room[key[0]]
-        lo, hi = _axis_span(room, key[2])
+        # randomize ALONG THE REAL WALL extent when known, else the room span
+        if g.get("wall_span"):
+            lo, hi = g["wall_span"]
+        else:
+            lo, hi = _axis_span(room, key[2])
         lo, hi = min(lo, g["iv"][0]), max(hi, g["iv"][1])
         obstacles = [iv for (iv, qz0, qz1) in ctx["wall_static"][key]
                      if _zov(g["z"][0], g["z"][1], qz0, qz1)]
@@ -627,8 +726,16 @@ def _solve(ctx, rng, attempts=40, params=None):
                 else:
                     rejected.append(f"wall_slides[{gi}]={prop:.2f}")
         else:
+            # land at a RANDOM position along the wall. When the real wall is
+            # known, sweep its FULL extent (true placement randomization); with
+            # no walls, fall back to a wall_slide-bounded jitter.
+            if g.get("wall_span"):
+                clo, chi = lo - g["iv"][0], hi - g["iv"][1]
+            else:
+                clo = max(-wall_slide, lo - g["iv"][0])
+                chi = min(wall_slide, hi - g["iv"][1])
             for _ in range(attempts):
-                cand = rng.uniform(-wall_slide, wall_slide)
+                cand = rng.uniform(clo, chi) if chi > clo else 0.0
                 if _grp_ok(cand):
                     s = cand
                     break
@@ -643,6 +750,17 @@ def _solve(ctx, rng, attempts=40, params=None):
     for b in bays:                      # members at their FINAL deltas
         for mi, p in enumerate(b["members"]):
             placed_blks.append((_blk_shift(b["blks"][mi], *delta[p]), p))
+    # wall equipment is a Z-AWARE obstacle for floor furniture: a chair must not
+    # overlap a low wall panel (gas manifold reaching the floor), but CAN sit
+    # under a high monitor (no z-overlap). Without this, floor items walked
+    # through low wall gear.
+    for gi, g in enumerate(wall_groups):
+        if g["in_bay"]:
+            continue
+        dxy = (g_now[gi][0] - g["iv"][0], 0.0) if g["key"][2] == "x" \
+            else (0.0, g_now[gi][0] - g["iv"][0])
+        for p in g["members"]:
+            placed_blks.append((_blk_shift(_blk(obj_by_path[p]["aabb"]), *dxy), p))
     pending = {p: (q, p) for p, q in ctx["orig_blks"].items()}
     for o in ctx["floor_movers"]:
         p = o["path"]
@@ -671,6 +789,13 @@ def _solve(ctx, rng, attempts=40, params=None):
                 cand = (foot, z0, z1)
                 if any(_blk_hit(cand, w) for i, w in enumerate(ctx["wb_blks"])
                        if i not in ex):
+                    return False
+                # CONFINEMENT: the move's PATH must not cross a wall (else the
+                # item would teleport into the next room through a gap). Walls
+                # the item already straddles (ex) don't count.
+                nc = (cx0 + cdx, cy0 + cdy)
+                if any(_seg_rect((cx0, cy0), nc, w[0]) and _zov(z0, z1, w[1], w[2])
+                       for i, w in enumerate(ctx["wb_blks"]) if i not in ex):
                     return False
             elif any(_rect_overlap(foot, w[0]) for w in ctx["floor_walls"][p]):
                 return False
@@ -708,44 +833,69 @@ def _solve(ctx, rng, attempts=40, params=None):
         placed_blks.append(((_rect_shift(f0, dx, dy), z0, z1), p))
         delta[p] = (dx, dy)
 
-    # 4) surface items -- ride the support + re-scatter on its top
-    for sup_path, items in ctx["riders_of"].items():
-        sup = obj_by_path[sup_path]
-        sdx, sdy = delta.get(sup_path, (0.0, 0.0))
-        (smn, smx) = sup["aabb"]
-        inset = 0.15 if sup["class"] in BED_CLASSES else 0.02
-        placed_r = []
-        # not-yet-placed riders block at their ORIGINAL spots, so a rider
-        # falling back to its original never collides with a later one
-        pending_r = {o["path"]: _foot(o["aabb"]) for o in items}
-        for o in items:
-            p = o["path"]
-            del pending_r[p]
-            hx = 0.5 * (o["aabb"][1][0] - o["aabb"][0][0])
-            hy = 0.5 * (o["aabb"][1][1] - o["aabb"][0][1])
-            ccx = 0.5 * (o["aabb"][0][0] + o["aabb"][1][0])
-            ccy = 0.5 * (o["aabb"][0][1] + o["aabb"][1][1])
-            x0, x1 = smn[0] + hx + inset, smx[0] - hx - inset
-            y0, y1 = smn[1] + hy + inset, smx[1] - hy - inset
-            ncx, ncy = ccx, ccy
-            if x1 > x0 and y1 > y0:
-                for _ in range(20):
-                    tx, ty = rng.uniform(x0, x1), rng.uniform(y0, y1)
-                    rect = [tx - hx, ty - hy, tx + hx, ty + hy]
-                    if any(_rect_overlap(rect, q, margin=0.01)
-                           for q in placed_r + list(pending_r.values())):
-                        continue
-                    ncx, ncy = tx, ty
-                    break
-            placed_r.append([ncx - hx, ncy - hy, ncx + hx, ncy + hy])
-            delta[p] = (ncx - ccx + sdx, ncy - ccy + sdy)
+    # 4) surface items -- PLACEMENT RANDOMIZATION onto a random ALLOWED host.
+    # Host equivalence (placement_affordances): a paperbox lands on the bed OR a
+    # bedside table OR an overbed table -- whichever a random draw picks -- at a
+    # random free spot on its top (or on a room floor for "floor" hosts). z is
+    # set so the item rests on that host, so it can move BETWEEN hosts of
+    # different heights (unlike the old ride-your-one-support scatter).
+    delta_z = {}
+    on_host = defaultdict(list)         # host_path -> rects already placed on it
+    for o in (oo for oo in ctx["objs"] if roles[oo["path"]] == "surface"):
+        p = o["path"]
+        (omn, omx) = o["aabb"]
+        hx, hy = 0.5 * (omx[0] - omn[0]), 0.5 * (omx[1] - omn[1])
+        ocx, ocy, obot = 0.5 * (omn[0] + omx[0]), 0.5 * (omn[1] + omx[1]), omn[2]
+        order = list(ctx["surface_hosts"].get(p, []))
+        rng.shuffle(order)
+        for kind, sel in order:
+            if kind == "on":
+                host = obj_by_path.get(sel)
+                if host is None:
+                    continue
+                hdx, hdy = delta.get(sel, (0.0, 0.0))
+                (hmn, hmx) = host["aabb"]
+                inset = 0.15 if host["class"] in BED_CLASSES else 0.02
+                x0, x1 = hmn[0] + hdx + hx + inset, hmx[0] + hdx - hx - inset
+                y0, y1 = hmn[1] + hdy + hy + inset, hmx[1] + hdy - hy - inset
+                top = hmx[2]
+            else:                       # ("floor", room)
+                room = by_room[sel]
+                x0, x1 = room["xmin"] + hx, room["xmax"] - hx
+                y0, y1 = room["ymin"] + hy, room["ymax"] - hy
+                top = floor_z
+            if x1 <= x0 or y1 <= y0:
+                continue
+            sz = omx[2] - omn[2]
+            host_path = sel if kind == "on" else None
+            done = False
+            for _ in range(25):
+                tx, ty = rng.uniform(x0, x1), rng.uniform(y0, y1)
+                rect = [tx - hx, ty - hy, tx + hx, ty + hy]
+                key = sel if kind == "on" else f"floor:{sel}"
+                if any(_rect_overlap(rect, q, margin=0.01) for q in on_host[key]):
+                    continue
+                # Z-aware: don't land under an overhang (a remote on the bed must
+                # avoid the strip the overbed table cantilevers over) or inside
+                # any other furniture; the host itself is exempt.
+                cand = (rect, top, top + sz)
+                if any(tag != host_path and _blk_hit(cand, q, margin=0.01)
+                       for q, tag in placed_blks):
+                    continue
+                on_host[key].append(rect)
+                delta[p] = (tx - ocx, ty - ocy)
+                delta_z[p] = top - obot       # rest the item's bottom on `top`
+                done = True
+                break
+            if done:
+                break
 
-    # 5) emit world translates
+    # 5) emit world translates (surfaces may also change z to sit on their host)
     out = {}
     for o in ctx["objs"]:
         ox, oy, oz = ctx["pos0"][o["path"]]
         dx, dy = delta.get(o["path"], (0.0, 0.0))
-        out[o["path"]] = (ox + dx, oy + dy, oz)
+        out[o["path"]] = (ox + dx, oy + dy, oz + delta_z.get(o["path"], 0.0))
     return out, rejected
 
 
@@ -777,6 +927,39 @@ def apply_layout(ctx, params, seed=0):
     the ORIGINAL pose; rider scatter uses `seed`. -> (positions, rejected)."""
     rng = random.Random(seed)
     return _solve(ctx, rng, params=params or {})
+
+
+def validate_grounding(object_targets, floor_z, tol=0.05):
+    """Analytic gravity check: every object DECLARED to rest on the floor or a
+    surface must actually have something directly under it; if its bottom floats
+    above that, the placement is invalid (it would fall). Wall-attached and
+    fixed objects are exempt (held up by the wall / built in). This is the cheap
+    deterministic equivalent of dropping each free body under physics and seeing
+    whether it settles where it was placed. -> list of (path, class, reason)."""
+    from layout import affordances as _paff
+    supports = [o for o in object_targets
+                if _paff.provides_surface(o["class"]) or
+                (o["aabb"][1][0] - o["aabb"][0][0]) *
+                (o["aabb"][1][1] - o["aabb"][0][1]) >= _SUPPORT_MIN_AREA]
+    bad = []
+    for o in object_targets:
+        cls = o["class"]
+        support = o.get("affordance") or _paff.support_of(cls)
+        zb = o["aabb"][0][2]
+        if support in ("wall", "fixed"):
+            continue
+        # an elevated surface-class item declared 'floor' rests on a surface the
+        # dump couldn't detect (unmodeled counter/shelf) -- it stays put, exempt
+        if support == "floor" and _paff.support_of(cls) == "surface" and \
+           (zb - floor_z) > _ELEVATED:
+            continue
+        if support == "floor":
+            if zb > floor_z + tol:
+                bad.append((o["path"], cls, f"floats {zb - floor_z:.2f}m above floor"))
+        elif support == "surface":
+            if _find_support(o, supports) is None:
+                bad.append((o["path"], cls, "no support object under it"))
+    return bad
 
 
 def build_ctx(object_targets, rooms, floor_z, **kw):

@@ -17,9 +17,9 @@ from pathlib import Path
 
 from pxr import Usd
 
-PROJECT = Path(__file__).resolve().parent
-sys.path.insert(0, str(PROJECT / "ROS2_bridge" / "src"))
-from fixed_categories import FIXED_CATEGORIES  # noqa: E402
+PROJECT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT / "src"))
+from common.categories import FIXED_CATEGORIES  # noqa: E402
 
 STAGE = sys.argv[1] if len(sys.argv) > 1 else str(
     PROJECT / "Collected_Ward0505" / "Ward0505.usd")

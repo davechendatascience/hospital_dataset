@@ -29,9 +29,9 @@ from pycocotools import mask as coco_mask
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(PROJECT_ROOT / "ROS2_bridge" / "src"))
-from fixed_categories import FIXED_CATEGORIES  # type: ignore  # noqa: E402
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from common.categories import FIXED_CATEGORIES  # type: ignore  # noqa: E402
 
 
 def parse_args():

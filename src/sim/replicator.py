@@ -29,9 +29,9 @@ import os
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-DEFAULT_STAGE = str(PROJECT_ROOT / "Collected_Ward0505" / "Ward0505.usd")
+DEFAULT_STAGE = str(PROJECT_ROOT / "data" / "Collected_Ward0524" / "Ward0524.usd")
 DEFAULT_OUT   = str(PROJECT_ROOT / "Ward_dataset_v2")
 
 
@@ -99,6 +99,22 @@ def parse_args():
                    help="Probability that a floor item is re-placed ANYWHERE "
                         "in its room (collision-checked) instead of jittered "
                         "near its original spot. 0 = local-only (v2 behavior).")
+    p.add_argument("--layout-spec", default=None,
+                   help="Path to a slot_layout JSON. When set, the scene's "
+                        "FURNITURE is generated from the spec's precomputed "
+                        "slots instead of read from the authored stage: the "
+                        "authored prims of the spec's classes are hidden, each "
+                        "slot's asset USD is referenced in (or a labeled proxy "
+                        "Cube if the USD is missing), and object_targets/rooms "
+                        "come from slot_layout.populate(). Walls, fixtures and "
+                        "lighting from the stage are kept. See slot_layout.py.")
+    p.add_argument("--dump-spec-template", default=None, metavar="PATH",
+                   help="Read the authored stage and write a STARTER slot_layout "
+                        "JSON to PATH (rooms + one slot per labeled object, in "
+                        "the stage's real world frame, via slot_layout."
+                        "template_from_targets), then exit WITHOUT rendering. "
+                        "Edit the result and pass it back via --layout-spec. "
+                        "Use without --layout-spec.")
     p.add_argument("--extra-channels", action="store_true", default=False,
                    help="Also export ground-truth DEPTH (distance_to_camera + "
                         "distance_to_image_plane), surface NORMALS, and stable "
@@ -138,8 +154,8 @@ import omni.replicator.core as rep                    # noqa: E402
 from pxr import Usd, UsdGeom, UsdLux, Sdf, Gf         # noqa: E402
 
 # Load your taxonomy so the same class names are used everywhere.
-sys.path.insert(0, str(PROJECT_ROOT / "ROS2_bridge" / "src"))
-from fixed_categories import (                        # noqa: E402
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from common.categories import (                        # noqa: E402
     FIXED_CATEGORIES, normalize_label, class_from_entry, supercategory_of)
 
 random.seed(args.seed)
@@ -475,6 +491,188 @@ if not flagged_any:
 
 
 # ============================================================================
+# Step 3a' — OPTIONAL: replace authored furniture with a slot-spec layout.
+# When --layout-spec is given, the FURNITURE comes from precomputed slots
+# (slot_layout.populate) rather than the authored stage: authored prims of the
+# spec's classes are hidden, each slot's asset is referenced in (or proxied by
+# a labeled Cube), and object_targets/rooms are rebound to the generated set.
+# Walls / fixtures / lighting from the stage are untouched. See slot_layout.py.
+# ============================================================================
+LAYOUT_ROOMS = None          # set below when --layout-spec is used
+
+
+def hide_authored_objects(stage, authored_targets, classes):
+    """Make the authored prims whose class is in `classes` invisible, so the
+    spec-generated furniture doesn't double up with the originals. Walls,
+    fixtures and unrelated authored objects are left visible. -> count hidden."""
+    n = 0
+    for ot in authored_targets:
+        if ot["class"] not in classes:
+            continue
+        prim = stage.GetPrimAtPath(ot["path"])
+        if prim and prim.IsValid():
+            UsdGeom.Imageable(prim).MakeInvisible()
+            n += 1
+    return n
+
+
+def spawn_layout(stage, targets, root="/World/Generated"):
+    """Instantiate each populated slot object into the stage: an Xform at the
+    object's centroid that either references the slot's asset USD or, if that
+    file is absent, holds a unit Cube scaled to the object's size as a labeled
+    proxy. The 'class' semantic is authored so Replicator's annotators pick it
+    up exactly like the authored prims. Mutates `targets[*]['path']` to the
+    spawned prim path. -> count spawned."""
+    from pxr import Semantics  # type: ignore
+    UsdGeom.Scope.Define(stage, root)
+    n = 0
+    for t in targets:
+        # sanitize the slot-derived path into a single prim under `root`
+        leaf = t["path"].replace("/World/Generated/", "").strip("/")
+        leaf = re.sub(r"[^A-Za-z0-9_]", "_", leaf)
+        path = f"{root}/{leaf}"
+        xform = UsdGeom.Xform.Define(stage, path)
+        prim = xform.GetPrim()
+        cx, cy, cz = t["translate"]
+
+        usd = t.get("usd") or ""
+        usd_abs = usd if os.path.isabs(usd) else str(PROJECT_ROOT / usd)
+        xf = t.get("_xform")
+        if usd and os.path.isfile(usd_abs):
+            prim.GetReferences().AddReference(usd_abs)
+            xform.AddTranslateOp().Set(Gf.Vec3d(float(cx), float(cy), float(cz)))
+            if xf:
+                # replay the authored orientation/scale; the slot only moved the
+                # position (translate already carries the pivot offset). Op order
+                # translate->orient->scale matches UsdGeom's canonical SRT, and
+                # rep.modify.pose still drives the translate op per frame.
+                q = xf.get("quat")
+                s = xf.get("scale")
+                if q:
+                    xform.AddOrientOp().Set(Gf.Quatf(float(q[0]), float(q[1]),
+                                                     float(q[2]), float(q[3])))
+                if s:
+                    xform.AddScaleOp().Set(Gf.Vec3f(float(s[0]), float(s[1]),
+                                                    float(s[2])))
+        else:
+            # labeled proxy: unit cube (spans [-0.5, 0.5]) scaled to the size
+            xform.AddTranslateOp().Set(Gf.Vec3d(float(cx), float(cy), float(cz)))
+            sx, sy, sz = t["size"]
+            cube = UsdGeom.Cube.Define(stage, f"{path}/proxy")
+            cube.CreateSizeAttr(1.0)
+            UsdGeom.Xformable(cube).AddScaleOp().Set(
+                Gf.Vec3f(float(sx), float(sy), float(sz)))
+
+        sem = Semantics.SemanticsAPI.Apply(prim, "Semantics")
+        sem.CreateSemanticTypeAttr().Set("class")
+        sem.CreateSemanticDataAttr().Set(t["class"])
+        t["path"] = path
+        n += 1
+    return n
+
+
+def _collect_asset_paths(op):
+    """Pull authored assetPath strings out of a references/payload metadatum
+    (handles both a single Sdf.Reference/Payload and the various list-op
+    fields). -> list of asset path strings, strongest first."""
+    if op is None:
+        return []
+    if hasattr(op, "assetPath"):              # a bare Sdf.Reference / Sdf.Payload
+        return [op.assetPath] if op.assetPath else []
+    paths = []
+    for field in ("prependedItems", "explicitItems", "orderedItems",
+                  "appendedItems", "addedItems"):
+        for it in getattr(op, field, []) or []:
+            ap = getattr(it, "assetPath", "")
+            if ap:
+                paths.append(ap)
+    return paths
+
+
+def asset_path_of(prim, stage_dir):
+    """Resolve the external asset this prim (or its first referencing
+    descendant) pulls in, as an absolute path. '' if it's defined inline."""
+    for node in Usd.PrimRange(prim, Usd.TraverseInstanceProxies()):
+        for key in ("references", "payloads", "payload"):
+            for ap in _collect_asset_paths(node.GetMetadata(key)):
+                if not os.path.isabs(ap):
+                    ap = os.path.normpath(os.path.join(stage_dir, ap.lstrip("./")))
+                return ap
+    return ""
+
+
+def estimate_floor_z(object_targets, bin_m=0.05):
+    """Robust floor level for the slot spec: the MODAL object-AABB bottom (where
+    the bulk of furniture rests), not min() -- a single sunken prim (a door
+    threshold, a sub-floor collision mesh) otherwise drags floor_z metres below
+    where everything actually sits, which then reads as everything 'floating'."""
+    from collections import Counter
+    bins = Counter(round(o["aabb"][0][2] / bin_m) * bin_m for o in object_targets)
+    return float(bins.most_common(1)[0][0])
+
+
+def oriented_corner_offsets(prim, bcache, centroid):
+    """The 8 corners of the prim's ORIENTED world bounding box, as offsets from
+    its world AABB centre, ordered to match test_slot_layout's box faces. Lets
+    the offline 3D view draw the asset's true rotation (the axis-aligned `size`
+    can't recover it). Corner order: z-bottom ring (--,+-,++,-+) then z-top."""
+    bb = bcache.ComputeWorldBound(prim)
+    M, rng = bb.GetMatrix(), bb.GetBox()
+    mn, mx = rng.GetMin(), rng.GetMax()
+    combos = [(mn[0], mn[1], mn[2]), (mx[0], mn[1], mn[2]),
+              (mx[0], mx[1], mn[2]), (mn[0], mx[1], mn[2]),
+              (mn[0], mn[1], mx[2]), (mx[0], mn[1], mx[2]),
+              (mx[0], mx[1], mx[2]), (mn[0], mx[1], mx[2])]
+    out = []
+    for c in combos:
+        w = M.Transform(Gf.Vec3d(c[0], c[1], c[2]))
+        out.append([float(w[0] - centroid[0]), float(w[1] - centroid[1]),
+                    float(w[2] - centroid[2])])
+    return out
+
+
+def xform_of_prim(prim, centroid):
+    """Decompose the prim's world transform into the rotation (quat w,x,y,z) +
+    scale the slot system replays, plus the pivot offset (prim translate minus
+    world AABB centre) so a re-placed asset lands its centre on the slot. Assumes
+    /World is identity (as the rest of this script does) and a TRS xform."""
+    M = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(
+        Usd.TimeCode.Default())
+    tr = Gf.Transform(M)
+    T, q, s = tr.GetTranslation(), tr.GetRotation().GetQuat(), tr.GetScale()
+    im = q.GetImaginary()
+    return {
+        "quat": [float(q.GetReal()), float(im[0]), float(im[1]), float(im[2])],
+        "scale": [float(s[0]), float(s[1]), float(s[2])],
+        "pivot_off": [float(T[0] - centroid[0]), float(T[1] - centroid[1]),
+                      float(T[2] - centroid[2])],
+    }
+
+
+if args.layout_spec:
+    from layout import slots as slot_layout
+    _spec = slot_layout.load_spec(args.layout_spec)
+    _spec_seed = args.placement_seed or args.seed
+    _gen_targets, LAYOUT_ROOMS, _spec_floor_z, _dropped = \
+        slot_layout.populate(_spec, seed=_spec_seed)
+    _seed_hits = slot_layout.check_overlaps(_gen_targets, _spec_floor_z)
+    print(f"[layout] spec {args.layout_spec}: {len(_gen_targets)} objects, "
+          f"{len(LAYOUT_ROOMS)} room(s), floor_z={_spec_floor_z}")
+    for d in _dropped:
+        print(f"[layout] DROPPED: {d}")
+    if _seed_hits:
+        print(f"[layout] WARNING: {len(_seed_hits)} seed overlap(s) (authoring "
+              f"error -- jitter may degrade these): {_seed_hits[:5]}")
+    _spec_classes = set(_spec["assets"].keys())
+    _n_hidden = hide_authored_objects(stage, object_targets, _spec_classes)
+    _n_spawn = spawn_layout(stage, _gen_targets)
+    print(f"[layout] hid {_n_hidden} authored prim(s) of {len(_spec_classes)} "
+          f"spec class(es); spawned {_n_spawn} generated prim(s)")
+    object_targets = _gen_targets
+    matched_paths = [t["path"] for t in _gen_targets]
+
+
+# ============================================================================
 # Step 3b — derive room INTERIOR bounds from the labeled object prims.
 # /CollisionMesh from step 3 covers the global collision world (way too big).
 # Hospital objects all live inside the room, so the AABB containing them is a
@@ -525,6 +723,12 @@ else:
     floor_z = float(bmin[2])
     print(f"[room] floor_z={floor_z:.2f}; camera height window will be "
           f"[{floor_z + args.height_min:.2f}, {floor_z + args.height_max:.2f}]")
+
+# The slot spec authors floor_z explicitly; trust it over the object-derived
+# bottom (the generated prims sit exactly on it by construction).
+if args.layout_spec:
+    floor_z = float(_spec_floor_z)
+    print(f"[room] floor_z overridden by --layout-spec: {floor_z:.2f}")
 
 
 # ============================================================================
@@ -956,8 +1160,20 @@ from PIL import Image  # noqa: E402
 _flood_rooms, wall_mask, plan_xmin, plan_ymin, grid_size = \
     detect_rooms_from_walls(stage, object_targets, args, floor_z)
 
-rooms = build_rooms_from_object_names(object_targets, pad_m=0.5)
-print(f"[rooms] {len(rooms)} room(s) assigned via prim-name patterns:")
+if args.layout_spec:
+    # Rooms come from the spec; attach members by each object's authored room
+    # (build_rooms_from_object_names keys off prim-name patterns the generated
+    # paths don't carry, so reuse the spec rooms and group targets into them).
+    rooms = [dict(r, members=[], area_m2=(r["xmax"] - r["xmin"]) *
+                  (r["ymax"] - r["ymin"])) for r in LAYOUT_ROOMS]
+    _room_by = {r["name"]: r for r in rooms}
+    for t in object_targets:
+        if t.get("room") in _room_by:
+            _room_by[t["room"]]["members"].append(t)
+    print(f"[rooms] {len(rooms)} room(s) from --layout-spec:")
+else:
+    rooms = build_rooms_from_object_names(object_targets, pad_m=0.5)
+    print(f"[rooms] {len(rooms)} room(s) assigned via prim-name patterns:")
 for room in rooms:
     cls_counts = Counter(m["class"] for m in room["members"])
     summary = ", ".join(f"{n}x{cls}" for cls, n in cls_counts.most_common(6))
@@ -975,6 +1191,60 @@ if args.save_layout_png and wall_mask is not None:
     layout_path.parent.mkdir(parents=True, exist_ok=True)
     save_layout_png(rooms, wall_mask, plan_xmin, plan_ymin, grid_size,
                     object_targets, layout_path)
+
+# --dump-spec-template: emit a ward-aligned starter slot spec from the authored
+# scene, then exit before any rendering. Run WITHOUT --layout-spec (the point is
+# to capture the AUTHORED layout's real coordinates as a spec you can edit).
+if args.dump_spec_template:
+    from layout import slots as slot_layout
+    if args.layout_spec:
+        print("[dump] WARNING: --dump-spec-template reads the AUTHORED scene; "
+              "ignore that --layout-spec is also set.")
+    _stage_dir = str(Path(args.stage).resolve().parent)
+    _bcache = UsdGeom.BBoxCache(Usd.TimeCode.Default(),
+                                [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
+    _usd_of, _xform_of = {}, {}
+    for _ot in object_targets:                # build_ctx needs translate + room
+        _prim = stage.GetPrimAtPath(_ot["path"])
+        _t = UsdGeom.Xformable(_prim).ComputeLocalToWorldTransform(
+            Usd.TimeCode.Default()).ExtractTranslation()
+        _ot["translate"] = (float(_t[0]), float(_t[1]), float(_t[2]))
+        _ot["room"] = assign_room(_ot["path"].rsplit("/", 1)[-1])
+        # capture the real asset + authored orientation/scale for faithful replay
+        _ap = asset_path_of(_prim, _stage_dir)
+        if _ap:
+            _usd_of[_ot["path"]] = _ap
+        _xf = xform_of_prim(_prim, _ot["centroid"])
+        _xf["corners"] = oriented_corner_offsets(_prim, _bcache, _ot["centroid"])
+        _xform_of[_ot["path"]] = _xf
+    _floor_spec = estimate_floor_z(object_targets)
+    if abs(_floor_spec - floor_z) > 0.02:
+        print(f"[dump] floor_z {floor_z:.2f} (min object bottom) looks dragged "
+              f"down by a sunken prim; using modal bottom {_floor_spec:.2f} "
+              f"as the spec floor_z")
+    _spec = slot_layout.template_from_targets(object_targets, rooms, _floor_spec,
+                                              wall_boxes=wall_aabbs,
+                                              usd_of=_usd_of, xform_of=_xform_of)
+    _n_usd = sum(1 for v in _usd_of.values() if v)
+    print(f"[dump] captured {_n_usd}/{len(object_targets)} asset USD refs + "
+          f"transforms")
+    # real wall geometry so the offline test can validate wall-adherence /
+    # penetration (the centroid-derived rooms are NOT the real walls)
+    _spec["walls"] = [[[float(v) for v in mn], [float(v) for v in mx]]
+                      for (mn, mx) in wall_aabbs]
+    _out = Path(args.dump_spec_template)
+    _out.parent.mkdir(parents=True, exist_ok=True)
+    _out.write_text(json.dumps(_spec, indent=2))
+    _n_slots = len(_spec["slots"])
+    _by_type = Counter(s["type"] for s in _spec["slots"])
+    print(f"[dump] wrote starter spec -> {_out}  ({_n_slots} slots: "
+          f"{dict(_by_type)}; {len(_spec['assets'])} asset class(es))")
+    print("[dump] each slot has a 'center' (authored position) so --layout-spec "
+          "reproduces the ward exactly. To MOVE an item, edit its 'center' (or "
+          "delete it to fall back to the parametric edge/t/rect). Exiting "
+          "without rendering.")
+    sim_app.close()
+    sys.exit(0)
 
 def sample_camera_pose(rng, centroid_of=None, extra_no_go=None):
     """Pick a room (weighted by labeled-object count), sample a camera
@@ -1092,15 +1362,19 @@ def sample_camera_trajectory(rng, n_frames, n_keys):
 PLACEMENT_SEQ = {}
 _ot_by_path = {}
 if args.randomize_placement:
-    import placement_dr
+    from layout import engine as placement_dr
     _pseed = args.placement_seed or args.seed
-    for _ot in object_targets:
-        _prim = stage.GetPrimAtPath(_ot["path"])
-        _M = UsdGeom.Xformable(_prim).ComputeLocalToWorldTransform(
-            Usd.TimeCode.Default())
-        _t = _M.ExtractTranslation()
-        _ot["translate"] = (float(_t[0]), float(_t[1]), float(_t[2]))
-        _ot["room"] = assign_room(_ot["path"].rsplit("/", 1)[-1])
+    # --layout-spec already gives every target a correct 'translate' and 'room'
+    # (from slot_layout.populate); only the authored-stage path needs to read
+    # them off the prims and infer the room from the prim name.
+    if not args.layout_spec:
+        for _ot in object_targets:
+            _prim = stage.GetPrimAtPath(_ot["path"])
+            _M = UsdGeom.Xformable(_prim).ComputeLocalToWorldTransform(
+                Usd.TimeCode.Default())
+            _t = _M.ExtractTranslation()
+            _ot["translate"] = (float(_t[0]), float(_t[1]), float(_t[2]))
+            _ot["room"] = assign_room(_ot["path"].rsplit("/", 1)[-1])
     _dump = {
         "objects": [{k: _ot[k] for k in
                      ("path", "class", "centroid", "aabb", "size",

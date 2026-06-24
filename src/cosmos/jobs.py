@@ -50,7 +50,7 @@ def scene_of(names: set) -> str:
         return "corridor"
     return "ward"
 
-PROJECT = Path(__file__).resolve().parent
+PROJECT = Path(__file__).resolve().parents[2]
 TEST = PROJECT / "ward_v3" / "test" / "images"
 COSMOS_REPO = Path("/home/edge-host/cosmos-transfer2.5")
 

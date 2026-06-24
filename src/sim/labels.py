@@ -32,7 +32,7 @@ import numpy as np
 from PIL import Image
 from pycocotools import mask as coco_mask
 
-PROJECT = Path(__file__).resolve().parent
+PROJECT = Path(__file__).resolve().parents[2]
 
 # prim (2nd path segment under /World) -> new class name, or None = delete
 TARGETS = {
