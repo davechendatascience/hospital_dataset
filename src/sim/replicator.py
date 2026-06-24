@@ -95,6 +95,11 @@ def parse_args():
                    help="Max XY translation (m) per cluster for --randomize-placement.")
     p.add_argument("--placement-seed", type=int, default=0,
                    help="Seed for placement DR (default: --seed).")
+    p.add_argument("--solver", action="store_true", default=False,
+                   help="Use the procedural constraint solver (layout/solver.py: "
+                        "zones + hard non-overlap + simulated annealing) for "
+                        "--randomize-placement instead of the legacy jitter "
+                        "sampler. Recommended with --layout-spec.")
     p.add_argument("--placement-global-frac", type=float, default=0.35,
                    help="Probability that a floor item is re-placed ANYWHERE "
                         "in its room (collision-checked) instead of jittered "
@@ -1386,15 +1391,23 @@ if args.randomize_placement:
     }
     Path(args.out).mkdir(parents=True, exist_ok=True)
     (Path(args.out) / "_placement_inputs.json").write_text(json.dumps(_dump))
-    _seq_all = placement_dr.generate(
-        object_targets, rooms, floor_z, n_frames=args.frames,
-        seed=_pseed, max_shift=args.placement_shift, wall_boxes=wall_aabbs,
-        global_frac=args.placement_global_frac)
+    if args.solver:
+        from layout import solver as _solver
+        _seq_all = _solver.generate(
+            object_targets, rooms, floor_z, n_frames=args.frames,
+            seed=_pseed, wall_boxes=wall_aabbs)
+        _how = "solver (zones + hard non-overlap + annealing)"
+    else:
+        _seq_all = placement_dr.generate(
+            object_targets, rooms, floor_z, n_frames=args.frames,
+            seed=_pseed, max_shift=args.placement_shift, wall_boxes=wall_aabbs,
+            global_frac=args.placement_global_frac)
+        _how = (f"jitter (max_shift={args.placement_shift} m, "
+                f"global_frac={args.placement_global_frac})")
     PLACEMENT_SEQ = {p: s for p, s in _seq_all.items() if len(set(s)) > 1}
     _ot_by_path = {o["path"]: o for o in object_targets}
-    print(f"[placement-dr] {len(PLACEMENT_SEQ)}/{len(_seq_all)} objects move "
-          f"across {args.frames} frames (max_shift={args.placement_shift} m, "
-          f"global_frac={args.placement_global_frac}, seed={_pseed})", flush=True)
+    print(f"[placement] {len(PLACEMENT_SEQ)}/{len(_seq_all)} objects move across "
+          f"{args.frames} frames via {_how}, seed={_pseed}", flush=True)
 
 
 def _moved_view(_f):

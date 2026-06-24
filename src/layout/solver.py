@@ -55,6 +55,20 @@ def _nearest_wall(center, walls):
     return best, run, perp
 
 
+def _room_of(cx, cy, rooms, fallback):
+    """The SMALLEST room AABB containing (cx, cy) -- geometric room assignment.
+    The spec's prim-name room can be wrong (a bin physically in the bathroom
+    labelled Ward); 'smallest box that contains it' fixes that and disambiguates
+    the overlapping centroid-derived room boxes. Falls back to the labelled room."""
+    best, best_a = None, 1e18
+    for r in rooms:
+        if r["xmin"] <= cx <= r["xmax"] and r["ymin"] <= cy <= r["ymax"]:
+            a = (r["xmax"] - r["xmin"]) * (r["ymax"] - r["ymin"])
+            if a < best_a:
+                best_a, best = a, r
+    return best if best is not None else fallback
+
+
 def build_zones(targets, rooms, floor_z, walls, ctx):
     """One feasible zone per object, from its role + affordance + geometry."""
     by_room = {r["name"]: r for r in rooms}
@@ -68,7 +82,9 @@ def build_zones(targets, rooms, floor_z, walls, ctx):
         sz = mx[2] - mn[2]
         cx0, cy0 = 0.5 * (mn[0] + mx[0]), 0.5 * (mn[1] + mx[1])
         cz = 0.5 * (mn[2] + mx[2])
-        room = by_room.get(o.get("room"))
+        # assign the room GEOMETRICALLY (smallest box containing it), not by the
+        # spec's prim-name room which can be wrong / ambiguous under overlap.
+        room = _room_of(cx0, cy0, rooms, by_room.get(o.get("room")))
 
         if role in ("fixture", "surface") or room is None:
             # fixtures don't move; surfaces are placed in stage 2
@@ -104,10 +120,22 @@ def build_zones(targets, rooms, floor_z, walls, ctx):
                             "half": (hx, hy), "sz": sz, "wall": wall, "role": role,
                             "cls": cls}
                 continue
-        # floor / bed / satellite (and wall items with no real walls) -> floor
+        # floor / bed / satellite (and wall items with no real walls) -> floor.
+        # The centroid-derived room AABBs OVERLAP (a small bathroom sits inside
+        # the ward's box), so a ward item's zone would include bathroom floor.
+        # Forbid it from any MORE-SPECIFIC (smaller-area) room it doesn't belong
+        # to -> a point belongs to the smallest room box containing it.
+        avoid = []
+        if room is not None:
+            my_area = (room["xmax"] - room["xmin"]) * (room["ymax"] - room["ymin"])
+            for r in rooms:
+                if r["name"] == room["name"]:
+                    continue
+                if (r["xmax"] - r["xmin"]) * (r["ymax"] - r["ymin"]) < my_area:
+                    avoid.append([r["xmin"], r["ymin"], r["xmax"], r["ymax"]])
         zones[p] = {"kind": "floor", "room": room, "z": floor_z + sz / 2,
                     "half": (hx, hy), "sz": sz, "c0": (cx0, cy0), "role": role,
-                    "cls": cls}
+                    "cls": cls, "avoid_rooms": avoid}
     return zones
 
 
@@ -183,22 +211,42 @@ def _feasible(p, c, centers, zones, walls, static, group_of, authored):
             continue
         if pdr._blk_hit(blk, pdr._blk(w), margin=0.0):
             return False
-    # floor item must not move to the far side of a wall (stay in its room)
-    if z["kind"] == "floor" and walls:
-        c0 = authored[p]
-        for w in walls:
-            wr = [w[0][0], w[0][1], w[1][0], w[1][1]]
-            if pdr._rect_overlap(blk[0], wr):
-                continue
-            if pdr._zov(blk[1], blk[2], w[0][2], w[1][2]) and \
-               pdr._seg_rect(c0, (c[0], c[1]), wr):
+    if z["kind"] == "floor":
+        # must not stray into a more-specific room it doesn't belong to (the
+        # ward/bathroom AABB overlap), even though that path crosses no wall
+        for ar in z.get("avoid_rooms", ()):
+            if pdr._rect_overlap(blk[0], ar):
                 return False
+        # must not move to the far side of a wall (stay in its room)
+        if walls:
+            c0 = authored[p]
+            for w in walls:
+                wr = [w[0][0], w[0][1], w[1][0], w[1][1]]
+                if pdr._rect_overlap(blk[0], wr):
+                    continue
+                if pdr._zov(blk[1], blk[2], w[0][2], w[1][2]) and \
+                   pdr._seg_rect(c0, (c[0], c[1]), wr):
+                    return False
     return True
 
 
 # ===================================================== SOFT preferences ==
 W_AGAINST = 4.0        # beds hug a wall
 W_NEARBED = 2.0        # satellites stay next to their bed
+W_WALLHUG = 3.0        # free-standing floor furniture (bins/chairs) prefers a wall
+DOOR_CLEARANCE = 0.5   # keep-out (m) around doors so furniture won't block them
+
+
+def _wall_gap(c, half, walls):
+    """Min XY gap from a footprint (centre c, half-extents) to any wall; 0 if
+    flush against one."""
+    x0, y0, x1, y1 = c[0] - half[0], c[1] - half[1], c[0] + half[0], c[1] + half[1]
+    best = 1e9
+    for w in walls:
+        dx = max(w[0][0] - x1, x0 - w[1][0], 0.0)
+        dy = max(w[0][1] - y1, y0 - w[1][1], 0.0)
+        best = min(best, math.hypot(dx, dy))
+    return 0.0 if best > 1e8 else best
 
 
 def _soft_energy(p, c, z, walls, bed_centers):
@@ -212,6 +260,10 @@ def _soft_energy(p, c, z, walls, bed_centers):
     if z["role"] == "satellite" and bed_centers:
         d = min(math.hypot(c[0] - b[0], c[1] - b[1]) for b in bed_centers)
         e += W_NEARBED * max(0.0, d - 1.0)
+    # free-standing floor furniture prefers to sit against a wall rather than in
+    # the open middle of the room (realism); satellites/beds handled above.
+    if z["role"] == "floor" and walls:
+        e += W_WALLHUG * _wall_gap(c, z["half"], walls)
     return e
 
 
@@ -359,9 +411,20 @@ def generate(object_targets, rooms, floor_z, n_frames, seed=1000,
                if zones[o["path"]]["kind"] in ("floor", "wall")]
     # fixtures are immovable OBSTACLES the annealer must avoid (a chair can't sit
     # inside the toilet); surfaces are placed in stage 2 so skip them here.
-    static = [(o["path"], _aabb(zones[o["path"]]["c"], zones[o["path"]]))
-              for o in object_targets
-              if zones[o["path"]]["kind"] == "fixed" and zones[o["path"]]["role"] != "surface"]
+    static = []
+    for o in object_targets:
+        z = zones[o["path"]]
+        if z["kind"] != "fixed" or z["role"] == "surface":
+            continue
+        ab = _aabb(z["c"], z)
+        if o["class"] == "door":
+            # full-height keep-out around doors so furniture doesn't block the
+            # doorway / swing -- an item flush to a door's inner side is valid by
+            # non-overlap but wrong; the clearance forbids it.
+            cl = DOOR_CLEARANCE
+            ab = ((ab[0][0] - cl, ab[0][1] - cl, ab[0][2]),
+                  (ab[1][0] + cl, ab[1][1] + cl, ab[1][2]))
+        static.append((o["path"], ab))
     authored = {o["path"]: (0.5 * (o["aabb"][0][0] + o["aabb"][1][0]),
                             0.5 * (o["aabb"][0][1] + o["aabb"][1][1]),
                             0.5 * (o["aabb"][0][2] + o["aabb"][1][2]))
